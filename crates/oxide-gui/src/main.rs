@@ -1,12 +1,15 @@
 //! Oxide desktop application.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-#![forbid(unsafe_code)]
+// `unsafe` is denied everywhere except the documented macOS Finder bridge.
+#![deny(unsafe_code)]
 
 mod app;
 mod components;
 #[cfg(debug_assertions)]
 mod devtools;
+#[cfg(target_os = "macos")]
+mod macos_open;
 mod theme;
 mod ui;
 
@@ -19,8 +22,13 @@ fn main() -> eframe::Result {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("OXIDE_LOG").unwrap_or_else(|_| "warn".into()))
         .init();
 
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
+
     // An archive passed on the command line (e.g. from a file association) is opened at start.
     let initial: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
+
+    #[cfg(target_os = "macos")]
+    macos_open::register();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -37,6 +45,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
+            #[cfg(target_os = "macos")]
+            macos_open::attach(&cc.egui_ctx);
             Ok(Box::new(app::OxideApp::new(&cc.egui_ctx, initial)))
         }),
     )

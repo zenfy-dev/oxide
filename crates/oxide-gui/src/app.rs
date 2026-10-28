@@ -237,6 +237,7 @@ impl OxideApp {
 
     /// Opens an archive chosen by the user (forgets any previous password).
     pub fn open_path(&mut self, ctx: &egui::Context, path: PathBuf) {
+        tracing::info!(path = %path.display(), "opening archive");
         self.password = None;
         self.run(ctx, Action::Open(path));
     }
@@ -316,6 +317,7 @@ impl OxideApp {
     fn job_succeeded(&mut self, ctx: &egui::Context, kind: JobKind, output: JobOutput) {
         match output {
             JobOutput::Listing(info) => {
+                tracing::info!(path = %info.path.display(), entries = info.entries.len(), "archive opened");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — Oxide", file_name(&info.path))));
                 self.search.clear();
                 self.archive = Some(OpenArchive::new(info));
@@ -419,6 +421,13 @@ impl eframe::App for OxideApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_job(&ctx);
+        #[cfg(target_os = "macos")]
+        {
+            let opened = crate::macos_open::take_opened();
+            if !opened.is_empty() {
+                self.handle_drop(&ctx, opened);
+            }
+        }
         #[cfg(debug_assertions)]
         crate::devtools::apply_demo(self, &ctx);
         crate::ui::draw(self, ui);
