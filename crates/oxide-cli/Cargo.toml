@@ -1,0 +1,35 @@
+[package]
+name = "oxide-cli"
+description = "Command-line archive manager built on oxide-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "oxide"
+path = "src/main.rs"
+
+[features]
+default = ["sevenz"]
+sevenz = ["oxide-core/sevenz"]
+rar = ["oxide-core/rar"]
+
+[dependencies]
+oxide-core = { workspace = true, default-features = false }
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+indicatif = "0.18.6"
+ctrlc = "3.5.2"
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile.workspace = true
+serde_json.workspace = true

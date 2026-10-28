@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Oxide
+GenericName=Archive Manager
+Comment=Open, create and extract ZIP, 7z, TAR and compressed archives
+Exec=oxide-gui %f
+Icon=oxide
+Terminal=false
+Categories=Utility;Archiving;Compression;
+MimeType=application/zip;application/x-7z-compressed;application/x-tar;application/x-compressed-tar;application/x-bzip-compressed-tar;application/x-xz-compressed-tar;application/x-zstd-compressed-tar;application/gzip;application/x-bzip2;application/x-xz;application/zstd;application/vnd.rar;
+Keywords=zip;7z;tar;archive;compress;extract;
+StartupWMClass=io.github.oxide-archiver.Oxide

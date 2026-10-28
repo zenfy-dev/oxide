@@ -1,0 +1,30 @@
+[package]
+name = "oxide-gui"
+description = "Desktop archive manager built on oxide-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "oxide-gui"
+path = "src/main.rs"
+
+[features]
+default = ["sevenz"]
+sevenz = ["oxide-core/sevenz"]
+rar = ["oxide-core/rar"]
+
+[dependencies]
+oxide-core = { workspace = true, default-features = false }
+eframe = "0.37.0"
+egui_extras = "0.37.0"
+rfd = "0.17.2"
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.34"
