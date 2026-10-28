@@ -6,8 +6,8 @@ use std::fs;
 
 use common::{has_temp_files, make_tree, noise, snapshot};
 use oxide_core::{
-    ArchiveFormat, CompressionMethod, CreateOptions, EncryptionMethod, EntryKind, ExtractOptions, OxideError, Password,
-    Progress, ReadOptions,
+    ArchiveFormat, CompressionMethod, CreateOptions, EncryptionMethod, ExtractOptions, OxideError, Password, Progress,
+    ReadOptions,
 };
 use tempfile::tempdir;
 
@@ -437,7 +437,7 @@ fn symlinks_round_trip() {
         let archive = tmp.path().join(format!("l.{}", format.extension()));
         oxide_core::create(std::slice::from_ref(&src), &archive, &CreateOptions::default(), &Progress::none()).unwrap();
         let info = oxide_core::list(&archive, &ReadOptions::default()).unwrap();
-        assert_eq!(info.entries.iter().filter(|e| e.kind == EntryKind::Symlink).count(), 2, "{format}");
+        assert_eq!(info.entries.iter().filter(|e| e.kind == oxide_core::EntryKind::Symlink).count(), 2, "{format}");
         let out = tmp.path().join(format!("lo-{}", format.extension()));
         oxide_core::extract(&archive, &out, &ExtractOptions::default(), &Progress::none()).unwrap();
         assert_eq!(snapshot(&src), snapshot(&out.join("links")), "{format}");
