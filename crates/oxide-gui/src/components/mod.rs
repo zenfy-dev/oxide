@@ -3,6 +3,7 @@
 pub mod create_dialog;
 pub mod extract_dialog;
 pub mod file_table;
+pub mod icons;
 pub mod progress;
 
 use std::path::PathBuf;

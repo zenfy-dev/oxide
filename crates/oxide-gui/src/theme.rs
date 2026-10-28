@@ -57,7 +57,7 @@ fn visuals(dark: bool) -> Visuals {
     v.extreme_bg_color = extreme;
     v.override_text_color = Some(text);
     v.hyperlink_color = ACCENT;
-    v.selection.bg_fill = ACCENT.gamma_multiply(if dark { 0.45 } else { 0.28 });
+    v.selection.bg_fill = ACCENT.gamma_multiply(if dark { 0.28 } else { 0.16 });
     v.selection.stroke = Stroke::new(1.0, if dark { Color32::WHITE } else { Color32::BLACK });
     v.window_corner_radius = CornerRadius::same(12);
     v.menu_corner_radius = CornerRadius::same(8);
@@ -96,39 +96,17 @@ pub fn weak(ui: &egui::Ui) -> Color32 {
     ui.visuals().weak_text_color()
 }
 
-/// The application icon, drawn procedurally so no image decoder is needed:
-/// a rounded rust-coloured square with a white ring.
-pub fn app_icon(size: u32) -> egui::IconData {
-    egui::IconData { rgba: icon_rgba(size), width: size, height: size }
+/// The application icon at 256×256, as raw RGBA generated from
+/// `assets/icon-source.png` by `packaging/gen_icons.py` (no image decoder needed).
+const ICON_RGBA: &[u8] = include_bytes!("../../../assets/icon-256.rgba");
+pub const ICON_SIZE: u32 = 256;
+
+/// The window/taskbar icon.
+pub fn app_icon() -> egui::IconData {
+    egui::IconData { rgba: ICON_RGBA.to_vec(), width: ICON_SIZE, height: ICON_SIZE }
 }
 
-pub fn icon_rgba(size: u32) -> Vec<u8> {
-    let s = size as f32;
-    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
-    let radius = s * 0.22;
-    let (top, bottom) = ([234.0, 108.0, 52.0], [176.0, 58.0, 22.0]);
-    for y in 0..size {
-        for x in 0..size {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            // Rounded-square coverage with a one-pixel soft edge.
-            let inset = s * 0.06;
-            let dx = (fx - s / 2.0).abs() - (s / 2.0 - inset - radius);
-            let dy = (fy - s / 2.0).abs() - (s / 2.0 - inset - radius);
-            let outside = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt() + dx.max(dy).min(0.0) - radius;
-            let cover = (0.5 - outside).clamp(0.0, 1.0);
-            let t = fy / s;
-            let mut c = [0.0f32; 3];
-            for i in 0..3 {
-                c[i] = top[i] + (bottom[i] - top[i]) * t;
-            }
-            // White ring.
-            let r = ((fx - s / 2.0).powi(2) + (fy - s / 2.0).powi(2)).sqrt();
-            let ring = (s * 0.075 - (r - s * 0.24).abs()).clamp(0.0, 1.0);
-            for ch in &mut c {
-                *ch += (255.0 - *ch) * ring;
-            }
-            rgba.extend([c[0] as u8, c[1] as u8, c[2] as u8, (cover * 255.0) as u8]);
-        }
-    }
-    rgba
+/// The icon as an image for drawing inside the window.
+pub fn icon_image() -> egui::ColorImage {
+    egui::ColorImage::from_rgba_unmultiplied([ICON_SIZE as usize; 2], ICON_RGBA)
 }

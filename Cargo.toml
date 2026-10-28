@@ -6,7 +6,7 @@ members = ["crates/oxide-core", "crates/oxide-cli", "crates/oxide-gui"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/oxide-archiver/oxide"
+repository = "https://github.com/zenfy-dev/oxide"
 rust-version = "1.95"
 
 [workspace.dependencies]

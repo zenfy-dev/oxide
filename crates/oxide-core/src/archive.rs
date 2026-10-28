@@ -272,7 +272,8 @@ pub fn test(path: &Path, options: &ReadOptions, progress: &Progress) -> Result<O
     let tracker = Tracker::new(progress, Operation::Test);
     let ctx = ReadContext { path, format, password: options.password.as_ref(), tracker: &tracker };
     tracker.set_input_total(ctx.archive_len());
-    let mut visitor = TestVisitor { tracker: &tracker, summary: OperationSummary::default() };
+    let mut visitor =
+        TestVisitor { tracker: &tracker, summary: OperationSummary::default(), buf: vec![0u8; 256 * 1024] };
     let result = handler.read(&ctx, &mut visitor);
     if progress.cancel_token().is_cancelled() {
         return Err(OxideError::Cancelled);
@@ -287,6 +288,7 @@ pub fn test(path: &Path, options: &ReadOptions, progress: &Progress) -> Result<O
 struct TestVisitor<'t, 'p> {
     tracker: &'t Tracker<'p>,
     summary: OperationSummary,
+    buf: Vec<u8>,
 }
 
 impl EntryVisitor for TestVisitor<'_, '_> {
@@ -311,7 +313,7 @@ impl EntryVisitor for TestVisitor<'_, '_> {
                 self.summary.files += 1;
                 match data {
                     Some(reader) => {
-                        let n = drain(reader, self.tracker)?;
+                        let n = drain(reader, self.tracker, &mut self.buf)?;
                         self.summary.bytes += n;
                     }
                     // The handler verified the data itself (RAR).
@@ -329,12 +331,11 @@ impl EntryVisitor for TestVisitor<'_, '_> {
 }
 
 /// Reads `reader` to the end, reporting progress and honouring cancellation.
-pub(crate) fn drain(reader: &mut dyn Read, tracker: &Tracker) -> Result<u64> {
-    let mut buf = vec![0u8; 256 * 1024];
+pub(crate) fn drain(reader: &mut dyn Read, tracker: &Tracker, buf: &mut [u8]) -> Result<u64> {
     let mut total = 0u64;
     loop {
         tracker.check_cancel()?;
-        let n = match reader.read(&mut buf) {
+        let n = match reader.read(buf) {
             Ok(0) => return Ok(total),
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,

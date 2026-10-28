@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use eframe::egui::{self, Align, Key, KeyboardShortcut, Layout, Modifiers, RichText};
 
 use crate::app::{OxideApp, file_name};
+use crate::components::icons::{self, Icon};
 use crate::components::{create_dialog, extract_dialog, file_table, human_bytes, progress};
 use crate::theme;
 
@@ -69,6 +70,27 @@ fn shortcuts(app: &mut OxideApp, ctx: &egui::Context) {
         if pressed(&UP) || (!typing && ctx.input(|i| i.key_pressed(Key::Backspace))) {
             a.go_up();
         }
+        let step = ctx.input(|i| {
+            if i.key_pressed(Key::ArrowDown) {
+                1
+            } else if i.key_pressed(Key::ArrowUp) && !i.modifiers.alt {
+                -1
+            } else {
+                0
+            }
+        });
+        if !typing && step != 0 && !a.rows.is_empty() {
+            let last = a.rows.len() as i64 - 1;
+            let next = match a.anchor {
+                Some(i) => (i as i64 + step).clamp(0, last),
+                None if step > 0 => 0,
+                None => last,
+            } as usize;
+            a.selection.clear();
+            a.selection.insert(a.rows[next].path.clone());
+            a.anchor = Some(next);
+            a.scroll_to = Some(next);
+        }
         if !typing && ctx.input(|i| i.key_pressed(Key::Enter)) {
             let target = a.rows.iter().find(|r| r.is_dir && a.selection.len() == 1 && a.selection.contains(&r.path));
             if let Some(dir) = target.map(|r| r.path.clone()) {
@@ -81,11 +103,10 @@ fn shortcuts(app: &mut OxideApp, ctx: &egui::Context) {
     }
 }
 
-fn tool_button(ui: &mut egui::Ui, enabled: bool, icon: &str, label: &str, tip: String) -> bool {
-    let text = RichText::new(format!("{icon}  {label}"));
-    ui.add_enabled(enabled, egui::Button::new(text).min_size(egui::vec2(0.0, 30.0)))
+fn tool_button(ui: &mut egui::Ui, enabled: bool, icon: Icon, label: &str, tip: String) -> bool {
+    icons::button(ui, icon, label, enabled, true)
         .on_hover_text(tip)
-        .on_disabled_hover_text("Open an archive first")
+        .on_disabled_hover_text(format!("{label}: open an archive first"))
         .clicked()
 }
 
@@ -96,32 +117,39 @@ fn toolbar(app: &mut OxideApp, ui: &mut egui::Ui) {
     let can_add = has && app.archive.as_ref().is_some_and(|a| a.supports_add());
     let sc = |s: &KeyboardShortcut| ctx.format_shortcut(s);
     ui.horizontal(|ui| {
-        if tool_button(ui, idle, "📂", "Open", format!("Open an archive ({})", sc(&OPEN))) {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if tool_button(ui, idle, Icon::Open, "Open", format!("Open an archive ({})", sc(&OPEN))) {
             app.pick_and_open(&ctx);
         }
-        if tool_button(ui, idle, "🗜", "Create", format!("Create a new archive ({})", sc(&CREATE))) {
+        if tool_button(ui, idle, Icon::Create, "Create", format!("Create a new archive ({})", sc(&CREATE))) {
             app.open_create_dialog(Vec::new());
         }
+        ui.add_space(4.0);
         ui.separator();
-        if tool_button(ui, has, "⬇", "Extract", format!("Extract files ({})", sc(&EXTRACT))) {
+        ui.add_space(4.0);
+        if tool_button(ui, has, Icon::Extract, "Extract", format!("Extract files ({})", sc(&EXTRACT))) {
             app.open_extract_dialog(false);
         }
-        if tool_button(ui, can_add, "➕", "Add", format!("Add files to this archive ({})", sc(&ADD))) {
+        let add_tip = if has && !can_add {
+            "Adding files is supported for ZIP and TAR archives".to_owned()
+        } else {
+            format!("Add files to this archive ({})", sc(&ADD))
+        };
+        if tool_button(ui, can_add, Icon::Add, "Add", add_tip) {
             app.pick_and_add(&ctx);
         }
-        if tool_button(ui, has, "✔", "Test", format!("Verify the archive's integrity ({})", sc(&TEST))) {
+        if tool_button(ui, has, Icon::Test, "Test", format!("Verify the archive's integrity ({})", sc(&TEST))) {
             app.test_archive(&ctx);
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let (icon, next, tip) = match app.theme {
-                egui::ThemePreference::System => ("🖥", egui::ThemePreference::Light, "Theme: follow system"),
-                egui::ThemePreference::Light => ("☀", egui::ThemePreference::Dark, "Theme: light"),
-                egui::ThemePreference::Dark => ("🌙", egui::ThemePreference::System, "Theme: dark"),
+                egui::ThemePreference::System => (Icon::System, egui::ThemePreference::Light, "Theme: follow system"),
+                egui::ThemePreference::Light => (Icon::Sun, egui::ThemePreference::Dark, "Theme: light"),
+                egui::ThemePreference::Dark => (Icon::Moon, egui::ThemePreference::System, "Theme: dark"),
             };
-            if ui.add(egui::Button::new(icon).frame(false)).on_hover_text(tip).clicked() {
-                app.theme = next;
-                ctx.set_theme(next);
+            if icons::button(ui, icon, "", true, false).on_hover_text(format!("{tip} (click to change)")).clicked() {
+                app.set_theme(&ctx, next);
             }
         });
     });
@@ -133,17 +161,17 @@ fn browser(app: &mut OxideApp, ui: &mut egui::Ui) {
     };
     // Navigation row: back / up, breadcrumbs, search.
     ui.horizontal(|ui| {
-        if ui.add_enabled(!archive.back.is_empty(), egui::Button::new("⬅").frame(false)).on_hover_text("Back").clicked()
-        {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if icons::button(ui, Icon::Back, "", !archive.back.is_empty(), false).on_hover_text("Back").clicked() {
             archive.go_back();
         }
-        if ui
-            .add_enabled(!archive.cwd.is_empty(), egui::Button::new("⬆").frame(false))
+        if icons::button(ui, Icon::Up, "", !archive.cwd.is_empty(), false)
             .on_hover_text("Enclosing folder (Backspace)")
             .clicked()
         {
             archive.go_up();
         }
+        ui.add_space(4.0);
         let mut target = None;
         let root = file_name(&archive.info.path);
         if ui.add(egui::Button::new(RichText::new(root).strong()).frame(false)).clicked() {
@@ -161,13 +189,7 @@ fn browser(app: &mut OxideApp, ui: &mut egui::Ui) {
             archive.navigate(t);
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let search = ui.add(
-                egui::TextEdit::singleline(&mut app.search).hint_text("🔍 Search in archive").desired_width(220.0),
-            );
-            if app.focus_search {
-                search.request_focus();
-                app.focus_search = false;
-            }
+            search_field(ui, &mut app.search, &mut app.focus_search);
         });
     });
     ui.add_space(4.0);
@@ -175,7 +197,11 @@ fn browser(app: &mut OxideApp, ui: &mut egui::Ui) {
     archive.refresh_rows(&app.search);
     if archive.rows.is_empty() {
         ui.centered_and_justified(|ui| {
-            let msg = if app.search.is_empty() { "This folder is empty" } else { "No matches" };
+            let msg = if app.search.is_empty() {
+                "This folder is empty".to_owned()
+            } else {
+                format!("Nothing in this archive matches “{}”", app.search.trim())
+            };
             ui.label(RichText::new(msg).color(theme::weak(ui)));
         });
         return;
@@ -187,6 +213,7 @@ fn browser(app: &mut OxideApp, ui: &mut egui::Ui) {
         &mut archive.anchor,
         archive.sort,
         archive.ascending,
+        archive.scroll_to.take(),
     );
     if let Some(key) = events.sort {
         if archive.sort == key {
@@ -205,26 +232,154 @@ fn browser(app: &mut OxideApp, ui: &mut egui::Ui) {
     }
 }
 
+/// A search box with a leading icon and a clear button.
+fn search_field(ui: &mut egui::Ui, text: &mut String, focus: &mut bool) {
+    // A fixed-size, left-to-right slot inside the right-to-left navigation row.
+    ui.allocate_ui_with_layout(egui::vec2(250.0, 30.0), Layout::left_to_right(Align::Center), |ui| {
+        search_frame(ui, text, focus);
+    });
+}
+
+fn search_frame(ui: &mut egui::Ui, text: &mut String, focus: &mut bool) {
+    egui::Frame::new()
+        .fill(ui.visuals().extreme_bg_color)
+        .stroke(ui.visuals().widgets.inactive.bg_stroke)
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| search_contents(ui, text, focus));
+}
+
+fn search_contents(ui: &mut egui::Ui, text: &mut String, focus: &mut bool) {
+    {
+        {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.set_width(232.0);
+            let weak = theme::weak(ui);
+            icons::show(ui, Icon::Search, weak);
+            let edit = egui::TextEdit::singleline(text)
+                .hint_text("Search in archive")
+                .frame(egui::Frame::NONE)
+                .align(egui::Align2::LEFT_CENTER)
+                .min_size(egui::vec2(0.0, 24.0))
+                .desired_width(176.0);
+            let response = ui.add(edit);
+            if *focus {
+                response.request_focus();
+                *focus = false;
+            }
+            if !text.is_empty()
+                && icons::button(ui, Icon::Close, "", true, false).on_hover_text("Clear (Esc)").clicked()
+            {
+                text.clear();
+            }
+        }
+    }
+}
+
 fn empty_state(app: &mut OxideApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
-    ui.vertical_centered(|ui| {
-        ui.add_space((ui.available_height() / 2.0 - 110.0).max(20.0));
-        ui.label(RichText::new("🗜").size(52.0));
-        ui.add_space(6.0);
-        ui.label(RichText::new("Drop an archive to open it").heading());
-        ui.label(RichText::new("or drop files and folders to compress them").color(theme::weak(ui)));
-        ui.add_space(16.0);
-        ui.horizontal(|ui| {
-            let width = 260.0;
-            ui.add_space((ui.available_width() - width).max(0.0) / 2.0);
-            if ui.add(theme::primary_button("Open archive…").min_size(egui::vec2(120.0, 32.0))).clicked() {
-                app.pick_and_open(&ctx);
+    let weak = theme::weak(ui);
+    let icon = app
+        .icon
+        .get_or_insert_with(|| ctx.load_texture("app-icon", theme::icon_image(), egui::TextureOptions::LINEAR))
+        .id();
+    let recent: Vec<PathBuf> = app.recent.iter().filter(|p| p.is_file()).cloned().collect();
+    let content_height = if recent.is_empty() { 254.0 } else { 324.0 + 34.0 * recent.len() as f32 };
+
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(((ui.available_height() - content_height) / 2.0).max(24.0));
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(icon, egui::vec2(96.0, 96.0))));
+            ui.add_space(10.0);
+            ui.label(RichText::new("Drop an archive to open it").heading());
+            ui.label(RichText::new("or drop files and folders to compress them").color(weak));
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                ui.add_space((ui.available_width() - 262.0).max(0.0) / 2.0);
+                if ui.add(theme::primary_button("Open archive…").min_size(egui::vec2(124.0, 32.0))).clicked() {
+                    app.pick_and_open(&ctx);
+                }
+                if ui.add(egui::Button::new("Create archive…").min_size(egui::vec2(124.0, 32.0))).clicked() {
+                    app.open_create_dialog(Vec::new());
+                }
+            });
+
+            if recent.is_empty() {
+                return;
             }
-            if ui.add(egui::Button::new("Create archive…").min_size(egui::vec2(120.0, 32.0))).clicked() {
-                app.open_create_dialog(Vec::new());
-            }
+            ui.add_space(30.0);
+            let width = 440.0_f32.min(ui.available_width() - 32.0);
+            ui.allocate_ui_with_layout(egui::vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Recent").strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(egui::Button::new(RichText::new("Clear").small().color(weak)).frame(false)).clicked()
+                        {
+                            app.recent.clear();
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                for path in &recent {
+                    if recent_row(ui, path, width).clicked() {
+                        app.open_path(&ctx, path.clone());
+                    }
+                }
+            });
         });
     });
+}
+
+/// One clickable line in the recent-archives list.
+fn recent_row(ui: &mut egui::Ui, path: &std::path::Path, width: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(rect, 6.0, ui.visuals().widgets.hovered.weak_bg_fill);
+        }
+        let text = ui.visuals().text_color();
+        let weak = theme::weak(ui);
+        let icon_rect =
+            egui::Rect::from_center_size(egui::pos2(rect.left() + 16.0, rect.center().y), egui::Vec2::splat(16.0));
+        icons::paint(painter, icon_rect, Icon::Archive, weak);
+        let name = painter.layout_no_wrap(file_name(path), egui::FontId::proportional(14.0), text);
+        let name_w = name.size().x;
+        painter.galley(egui::pos2(rect.left() + 34.0, rect.center().y - name.size().y / 2.0), name, text);
+        let max = (rect.width() - name_w - 60.0).max(40.0);
+        let folder = short_folder(painter, path, egui::FontId::proportional(12.0), weak, max);
+        let pos = egui::pos2(rect.right() - 10.0 - folder.size().x, rect.center().y - folder.size().y / 2.0);
+        painter.galley(pos, folder, weak);
+    }
+    response.on_hover_text(path.display().to_string()).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The folder containing `path` on one line: home shown as `~`, and the
+/// start trimmed with `…` until it fits in `max_width`.
+fn short_folder(
+    painter: &egui::Painter,
+    path: &std::path::Path,
+    font: egui::FontId,
+    color: egui::Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let parent = path.parent().unwrap_or(path);
+    let mut text = match std::env::home_dir().and_then(|h| parent.strip_prefix(h).ok().map(|r| r.to_path_buf())) {
+        Some(rel) if rel.as_os_str().is_empty() => "~".to_owned(),
+        Some(rel) => format!("~/{}", rel.display()),
+        None => parent.display().to_string(),
+    };
+    loop {
+        let galley = painter.layout_no_wrap(text.clone(), font.clone(), color);
+        let chars = text.chars().count();
+        if galley.size().x <= max_width || chars <= 4 {
+            return galley;
+        }
+        // Drop roughly the overflowing share of characters from the front.
+        let keep = ((chars as f32 * max_width / galley.size().x) as usize).saturating_sub(2).max(3).min(chars - 2);
+        let tail: String = text.chars().skip(chars - keep).collect();
+        text = format!("…{}", tail.trim_start_matches('…'));
+    }
 }
 
 fn status_bar(app: &OxideApp, ui: &mut egui::Ui) {
@@ -235,30 +390,35 @@ fn status_bar(app: &OxideApp, ui: &mut egui::Ui) {
             return;
         };
         let info = &a.info;
+        let folders = a.tree.dir_count();
         let mut text = format!(
-            "{} · {} files · {} folders · {} → {}",
+            "{} archive  ·  {} files, {} folders  ·  {} uncompressed, {} on disk",
             info.format,
             info.file_count(),
-            info.dir_count().max(a.tree.children("").iter().filter(|r| r.is_dir).count()),
+            folders,
             human_bytes(info.total_size()),
             human_bytes(info.archive_size)
         );
-        if let Some(ratio) = info.compression_ratio() {
-            text.push_str(&format!(" ({:.0}%)", ratio * 100.0));
-        }
-        if info.is_encrypted() {
-            text.push_str(" · 🔒 encrypted");
+        if let Some(ratio) = info.compression_ratio().filter(|r| *r < 1.0) {
+            text.push_str(&format!(" (saves {:.0}%)", (1.0 - ratio) * 100.0));
         }
         ui.label(RichText::new(text).small().color(weak));
+        if info.is_encrypted() {
+            ui.add_space(4.0);
+            icons::show(ui, Icon::Lock, weak);
+            ui.label(RichText::new("Encrypted").small().color(weak));
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if !a.selection.is_empty() {
+            let selected = a.selection.len();
+            let label = if !app.search.trim().is_empty() {
+                format!("{} matches", a.rows.len())
+            } else if selected > 0 {
                 let bytes: u64 = a.rows.iter().filter(|r| a.selection.contains(&r.path)).map(|r| r.size).sum();
-                ui.label(
-                    RichText::new(format!("{} selected · {}", a.selection.len(), human_bytes(bytes)))
-                        .small()
-                        .color(weak),
-                );
-            }
+                format!("{selected} selected  ·  {}", human_bytes(bytes))
+            } else {
+                String::new()
+            };
+            ui.label(RichText::new(label).small().color(weak));
         });
     });
 }
@@ -336,7 +496,7 @@ fn password_prompt(app: &mut OxideApp, ctx: &egui::Context) {
     let mut cancel = false;
     let r = egui::Modal::new(egui::Id::unique("password")).show(ctx, |ui| {
         ui.set_width(360.0);
-        ui.heading("🔒 Password required");
+        ui.heading("Password required");
         ui.add_space(6.0);
         let msg = if prompt.wrong { "That password didn't work. Try again." } else { "This archive is encrypted." };
         ui.label(RichText::new(msg).color(if prompt.wrong { ui.visuals().warn_fg_color } else { theme::weak(ui) }));

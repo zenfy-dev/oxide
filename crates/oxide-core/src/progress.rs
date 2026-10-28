@@ -6,8 +6,8 @@
 
 use std::cell::RefCell;
 use std::io::{self, Read};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -273,6 +273,56 @@ impl<'a> Tracker<'a> {
             },
         };
         cb(&s.update);
+    }
+}
+
+/// Progress made on worker threads. [`Tracker`] is single-threaded, so
+/// workers count here and the owning thread calls [`Self::forward`].
+#[derive(Default)]
+pub(crate) struct WorkerProgress {
+    bytes: AtomicU64,
+    files: AtomicU64,
+    current: Mutex<String>,
+}
+
+/// What [`WorkerProgress::forward`] has already passed on.
+#[derive(Default)]
+pub(crate) struct Forwarded {
+    bytes: u64,
+    files: u64,
+    current: String,
+}
+
+impl WorkerProgress {
+    pub(crate) fn add_bytes(&self, n: u64) {
+        self.bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub(crate) fn file_done(&self) {
+        self.files.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_current(&self, name: &str) {
+        name.clone_into(&mut self.current.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    /// Passes new progress to `tracker`. Call from the tracker's thread.
+    pub(crate) fn forward(&self, tracker: &Tracker, seen: &mut Forwarded) {
+        let bytes = self.bytes.load(Ordering::Relaxed);
+        tracker.add_bytes(bytes - seen.bytes);
+        seen.bytes = bytes;
+        {
+            let name = self.current.lock().unwrap_or_else(|e| e.into_inner());
+            if *name != seen.current {
+                name.clone_into(&mut seen.current);
+                tracker.start_entry(&seen.current);
+            }
+        }
+        let files = self.files.load(Ordering::Relaxed);
+        for _ in seen.files..files {
+            tracker.finish_entry();
+        }
+        seen.files = files;
     }
 }
 

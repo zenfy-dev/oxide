@@ -2,19 +2,22 @@
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, SystemTime};
 
 use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_rust2::{
     ArchiveEntry, ArchiveReader, ArchiveWriter, EncoderConfiguration, EncoderMethod, Error as SzError,
-    Password as SzPassword, SourceReader,
+    Password as SzPassword, PreparedBlock, SourceReader, prepare_block,
 };
 
 use crate::archive::{Entry, EntryKind, EntryVisitor, FormatHandler, ReadContext};
-use crate::compression::{CreateJob, InputItem, InputKind, TrackedReader};
+use crate::compression::{CreateJob, InputItem, InputKind};
 use crate::error::{IoContext, OxideError, Result};
 use crate::extraction::system_time_to_unix;
 use crate::formats::CompressionMethod;
+use crate::progress::{CancelToken, Forwarded, WorkerProgress};
 
 pub(crate) struct SevenZHandler;
 
@@ -29,6 +32,9 @@ const S_IFDIR: u32 = 0o040000;
 /// Upper bound on uncompressed bytes per solid block.
 const SOLID_BLOCK_BYTES: u64 = 256 * 1024 * 1024;
 const SOLID_BLOCK_FILES: usize = 10_000;
+/// Solid block size range when compressing blocks on several threads.
+const PARALLEL_BLOCK_MIN: u64 = 8 * 1024 * 1024;
+const PARALLEL_BLOCK_MAX: u64 = 64 * 1024 * 1024;
 const MAX_LINK_TARGET: u64 = 4096;
 
 fn map_err(err: SzError) -> OxideError {
@@ -134,6 +140,45 @@ impl FormatHandler for SevenZHandler {
 
     fn create(&self, out: &mut File, job: &CreateJob) -> Result<()> {
         let mut writer = ArchiveWriter::new(BufWriter::with_capacity(1 << 20, out)).map_err(map_err)?;
+        let sz_err = |e: SzError| if job.tracker.cancel().is_cancelled() { OxideError::Cancelled } else { map_err(e) };
+
+        // Plan solid blocks. With several threads, blocks are sized so there is
+        // enough of them to keep every thread busy.
+        let workers = job.threads.max(1) as usize;
+        let file_bytes: u64 = job.inputs.iter().map(InputItem::size).sum();
+        let block_target = if workers > 1 {
+            (file_bytes / (workers as u64 * 2)).clamp(PARALLEL_BLOCK_MIN, PARALLEL_BLOCK_MAX)
+        } else {
+            SOLID_BLOCK_BYTES
+        };
+        let mut blocks: Vec<Vec<BlockFile>> = Vec::new();
+        let mut block_bytes = 0u64;
+        for item in &job.inputs {
+            if let InputKind::File { size } = item.kind
+                && size > 0
+            {
+                let full = blocks.last().is_none_or(|b| {
+                    !b.is_empty() && (block_bytes + size > block_target || b.len() >= SOLID_BLOCK_FILES)
+                });
+                if full {
+                    blocks.push(Vec::new());
+                    block_bytes = 0;
+                }
+                block_bytes += size;
+                if let Some(b) = blocks.last_mut() {
+                    b.push(BlockFile {
+                        path: item.source.clone(),
+                        name: item.name.clone(),
+                        size,
+                        entry: archive_entry(item),
+                    });
+                }
+            }
+        }
+        // Parallel across blocks when there are enough; otherwise let LZMA2
+        // split a single large block across threads instead.
+        let parallel = workers > 1 && blocks.len() > 1;
+
         let mut methods: Vec<EncoderConfiguration> = Vec::new();
         if let Some(pw) = job.password {
             methods.push(AesEncoderOptions::new(SzPassword::new(pw.expose())).into());
@@ -141,47 +186,35 @@ impl FormatHandler for SevenZHandler {
         let level = job.level.unwrap_or(6).clamp(0, 9) as u32;
         methods.push(match job.method {
             CompressionMethod::Store => EncoderConfiguration::new(EncoderMethod::COPY),
-            CompressionMethod::Lzma2 if job.threads > 1 => {
+            CompressionMethod::Lzma2 if workers > 1 && !parallel => {
                 Lzma2Options::from_level_mt(level, job.threads, 16 * 1024 * 1024).into()
             }
             CompressionMethod::Lzma2 => Lzma2Options::from_level(level).into(),
             other => return Err(OxideError::InvalidOption(format!("7z cannot use the {other} method"))),
         });
-        writer.set_content_methods(methods);
+        writer.set_content_methods(methods.clone());
         writer.set_encrypt_header(job.password.is_some());
 
-        let sz_err = |e: SzError| if job.tracker.cancel().is_cancelled() { OxideError::Cancelled } else { map_err(e) };
-        let mut batch: Vec<&InputItem> = Vec::new();
-        let mut batch_bytes = 0u64;
+        // Entries without data: folders, empty files, and links (tiny).
         for item in &job.inputs {
             job.tracker.check_cancel()?;
             match &item.kind {
-                InputKind::File { size } if *size > 0 => {
-                    if !batch.is_empty() && (batch_bytes + size > SOLID_BLOCK_BYTES || batch.len() >= SOLID_BLOCK_FILES)
-                    {
-                        push_solid(&mut writer, std::mem::take(&mut batch), job).map_err(sz_err)?;
-                        batch_bytes = 0;
-                    }
-                    batch.push(item);
-                    batch_bytes += size;
-                }
+                InputKind::File { size } if *size > 0 => continue,
                 InputKind::File { .. } | InputKind::Directory => {
                     job.tracker.start_entry(&item.name);
                     writer.push_archive_entry(archive_entry(item), None::<&[u8]>).map_err(sz_err)?;
-                    job.tracker.finish_entry();
                 }
                 InputKind::Symlink { target } => {
                     job.tracker.start_entry(&item.name);
                     let mut entry = archive_entry(item);
                     entry.windows_attributes = UNIX_EXTENSION | ATTR_ARCHIVE | ((S_IFLNK | 0o777) << 16);
                     writer.push_archive_entry(entry, Some(target.as_bytes())).map_err(sz_err)?;
-                    job.tracker.finish_entry();
                 }
             }
+            job.tracker.finish_entry();
         }
-        if !batch.is_empty() {
-            push_solid(&mut writer, batch, job).map_err(sz_err)?;
-        }
+
+        compress_blocks(&mut writer, blocks, Arc::new(methods), if parallel { workers } else { 1 }, job)?;
         let mut inner = writer.finish().map_err(|e| job.map_err(e, std::path::Path::new("archive")))?;
         inner.flush()?;
         Ok(())
@@ -209,35 +242,156 @@ fn archive_entry(item: &InputItem) -> ArchiveEntry {
     entry
 }
 
-/// Opens its file on first read so a large solid block doesn't hold
-/// thousands of file handles at once.
-struct LazyInput<'j, 'a> {
-    job: &'j CreateJob<'a>,
-    item: &'j InputItem,
-    reader: Option<TrackedReader<'a, File>>,
+/// One input file assigned to a solid block.
+struct BlockFile {
+    path: std::path::PathBuf,
+    name: String,
+    size: u64,
+    entry: ArchiveEntry,
 }
 
-impl Read for LazyInput<'_, '_> {
+/// Reads one input file for a block: opened on first read (a block may hold
+/// thousands of files), honours cancellation, and refuses files that change
+/// size while being archived.
+struct BlockReader<'s> {
+    file: BlockFile,
+    reader: Option<File>,
+    remaining: u64,
+    finished: bool,
+    shared: &'s WorkerProgress,
+    cancel: &'s CancelToken,
+}
+
+impl Read for BlockReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.reader.is_none() {
-            self.job.tracker.start_entry(&self.item.name);
-            self.reader = Some(self.job.open(self.item).map_err(|e| io::Error::other(e.to_string()))?);
+        if self.cancel.is_cancelled() {
+            return Err(io::Error::other("operation cancelled"));
         }
-        let n = self.reader.as_mut().map_or(Ok(0), |r| r.read(buf))?;
-        if n == 0 {
-            self.job.tracker.finish_entry();
+        if self.reader.is_none() {
+            self.reader = Some(File::open(&self.file.path)?);
+            self.shared.set_current(&self.file.name);
+        }
+        let max = buf.len().min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let n = match &mut self.reader {
+            Some(r) if max > 0 => r.read(&mut buf[..max])?,
+            _ => 0,
+        };
+        if n == 0 && self.remaining > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{} shrank while it was being archived", self.file.path.display()),
+            ));
+        }
+        self.remaining -= n as u64;
+        self.shared.add_bytes(n as u64);
+        if self.remaining == 0 && !std::mem::replace(&mut self.finished, true) {
+            self.shared.file_done();
+            self.reader = None; // close as soon as the file is done
         }
         Ok(n)
     }
 }
 
-fn push_solid<W: Write + io::Seek>(
+/// Compresses `blocks` on `workers` threads and appends them in order.
+fn compress_blocks<W: Write + io::Seek>(
     writer: &mut ArchiveWriter<W>,
-    items: Vec<&InputItem>,
+    blocks: Vec<Vec<BlockFile>>,
+    methods: Arc<Vec<EncoderConfiguration>>,
+    workers: usize,
     job: &CreateJob,
-) -> std::result::Result<(), SzError> {
-    let entries = items.iter().map(|i| archive_entry(i)).collect();
-    let readers = items.iter().map(|item| SourceReader::new(LazyInput { job, item, reader: None })).collect();
-    writer.push_archive_entries(entries, readers)?;
+) -> Result<()> {
+    let total = blocks.len();
+    if total == 0 {
+        return Ok(());
+    }
+    let shared = WorkerProgress::default();
+    let cancel = job.tracker.cancel().clone();
+    let slots: Vec<Mutex<Option<Vec<BlockFile>>>> = blocks.into_iter().map(|b| Mutex::new(Some(b))).collect();
+    let next = AtomicUsize::new(0);
+    let appended = AtomicUsize::new(0);
+    let abort = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<(usize, std::result::Result<PreparedBlock, SzError>)>();
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let (tx, methods) = (tx.clone(), methods.clone());
+            let (slots, next, appended, abort, shared, cancel) = (&slots, &next, &appended, &abort, &shared, &cancel);
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= total {
+                        return;
+                    }
+                    // Stay at most two blocks per thread ahead of the writer, bounding memory.
+                    while i >= appended.load(Ordering::Relaxed) + workers * 2 {
+                        if abort.load(Ordering::Relaxed) || cancel.is_cancelled() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    if abort.load(Ordering::Relaxed) || cancel.is_cancelled() {
+                        return;
+                    }
+                    let files = slots[i].lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+                    let (entries, readers): (Vec<_>, Vec<_>) = files
+                        .into_iter()
+                        .map(|f| {
+                            let entry = f.entry.clone();
+                            let remaining = f.size;
+                            let reader =
+                                BlockReader { file: f, reader: None, remaining, finished: false, shared, cancel };
+                            (entry, SourceReader::new(reader))
+                        })
+                        .collect();
+                    if tx.send((i, prepare_block(methods.clone(), entries, readers))).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let result = append_in_order(writer, &rx, total, &appended, &shared, job);
+        if result.is_err() {
+            abort.store(true, Ordering::Relaxed);
+        }
+        result
+    })
+}
+
+/// Receives prepared blocks, appends them in block order, and forwards progress.
+fn append_in_order<W: Write + io::Seek>(
+    writer: &mut ArchiveWriter<W>,
+    rx: &mpsc::Receiver<(usize, std::result::Result<PreparedBlock, SzError>)>,
+    total: usize,
+    appended: &AtomicUsize,
+    shared: &WorkerProgress,
+    job: &CreateJob,
+) -> Result<()> {
+    let sz_err = |e: SzError| if job.tracker.cancel().is_cancelled() { OxideError::Cancelled } else { map_err(e) };
+    let mut ready = std::collections::BTreeMap::new();
+    let mut seen = Forwarded::default();
+    let mut want = 0;
+    while want < total {
+        shared.forward(job.tracker, &mut seen);
+        job.tracker.check_cancel()?;
+
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok((i, block)) => {
+                ready.insert(i, block);
+                while let Some(block) = ready.remove(&want) {
+                    writer.push_prepared_block(block.map_err(sz_err)?).map_err(sz_err)?;
+                    want += 1;
+                    appended.store(want, Ordering::Relaxed);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                job.tracker.check_cancel()?;
+                return Err(OxideError::from(io::Error::other("7z compression threads stopped early")));
+            }
+        }
+    }
+    shared.forward(job.tracker, &mut seen);
     Ok(())
 }

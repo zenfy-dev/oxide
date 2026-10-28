@@ -10,6 +10,7 @@ mod components;
 mod devtools;
 #[cfg(target_os = "macos")]
 mod macos_open;
+mod quick_extract;
 mod theme;
 mod ui;
 
@@ -37,7 +38,10 @@ fn main() -> eframe::Result {
             .with_inner_size([980.0, 640.0])
             .with_min_inner_size([620.0, 400.0])
             .with_drag_and_drop(true)
-            .with_icon(theme::app_icon(128)),
+            // On macOS the window starts hidden: an archive double-clicked in Finder
+            // is extracted without ever showing it (see `app::LaunchMode`).
+            .with_visible(!cfg!(target_os = "macos"))
+            .with_icon(theme::app_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -47,7 +51,7 @@ fn main() -> eframe::Result {
             theme::install(&cc.egui_ctx);
             #[cfg(target_os = "macos")]
             macos_open::attach(&cc.egui_ctx);
-            Ok(Box::new(app::OxideApp::new(&cc.egui_ctx, initial)))
+            Ok(Box::new(app::OxideApp::new(&cc.egui_ctx, cc.storage, initial)))
         }),
     )
 }

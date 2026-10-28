@@ -98,6 +98,8 @@ pub(crate) struct CreateJob<'a> {
     pub threads: u32,
     pub tracker: &'a Tracker<'a>,
     warnings: Vec<String>,
+    /// Copy buffer reused for every input file.
+    buf: std::cell::RefCell<Vec<u8>>,
 }
 
 impl<'a> CreateJob<'a> {
@@ -153,7 +155,8 @@ impl<'a> CreateJob<'a> {
         };
         let bytes = inputs.iter().map(InputItem::size).sum();
         tracker.set_totals(Some(inputs.len() as u64), Some(bytes));
-        Ok(CreateJob { format, inputs, method, level, password, encryption, threads, tracker, warnings })
+        let buf = std::cell::RefCell::new(vec![0u8; 256 * 1024]);
+        Ok(CreateJob { format, inputs, method, level, password, encryption, threads, tracker, warnings, buf })
     }
 
     /// Opens an input file for reading with progress, cancellation and a
@@ -165,9 +168,17 @@ impl<'a> CreateJob<'a> {
 
     /// Copies an input file's contents into `out`.
     pub(crate) fn copy_into(&self, item: &InputItem, out: &mut dyn Write) -> Result<()> {
-        let mut reader = io::BufReader::with_capacity(256 * 1024, self.open(item)?);
-        io::copy(&mut reader, out).map_err(|e| self.map_err(e, &item.source))?;
-        Ok(())
+        let mut reader = self.open(item)?;
+        let mut buf = self.buf.borrow_mut();
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(self.map_err(e, &item.source)),
+            };
+            out.write_all(&buf[..n]).map_err(|e| self.map_err(e, &item.source))?;
+        }
     }
 
     /// Converts an error raised mid-write, preferring `Cancelled` when the
@@ -285,7 +296,9 @@ pub(crate) fn collect_inputs(
     options: &CreateOptions,
     exclude: Option<&Path>,
 ) -> Result<(Vec<InputItem>, Vec<String>)> {
-    let exclude = exclude.and_then(|p| fs::canonicalize(p).ok());
+    // Resolving every walked path is expensive, so only paths whose file name
+    // matches the output's are resolved and compared.
+    let exclude = exclude.and_then(|p| Some((fs::canonicalize(p).ok()?, p.file_name()?.to_os_string())));
     let mut items = Vec::new();
     let mut warnings = Vec::new();
     let mut seen = HashSet::new();
@@ -314,7 +327,8 @@ pub(crate) fn collect_inputs(
                 continue;
             }
             let path = entry.path();
-            if let Some(ex) = &exclude
+            if let Some((ex, ex_name)) = &exclude
+                && entry.file_name() == ex_name.as_os_str()
                 && fs::canonicalize(path).ok().as_ref() == Some(ex)
             {
                 continue;
@@ -458,6 +472,138 @@ impl<W: Write> FinishWrite for zstd::stream::write::Encoder<'_, W> {
     }
 }
 
+/// Input chunk size for parallel gzip/bzip2. Each chunk becomes its own
+/// gzip member / bzip2 stream; concatenations of these are valid files
+/// that every decompressor reads in full (as `pigz` and `pbzip2` produce).
+const PARALLEL_CHUNK: usize = 1024 * 1024;
+
+type ChunkFn = dyn Fn(&[u8]) -> io::Result<Vec<u8>> + Send + Sync;
+
+/// Compresses fixed-size chunks on several threads and writes them in order.
+pub(crate) struct ParallelEncoder<W: Write> {
+    out: W,
+    chunk: Vec<u8>,
+    jobs: Option<std::sync::mpsc::SyncSender<(u64, Vec<u8>)>>,
+    results: std::sync::mpsc::Receiver<(u64, io::Result<Vec<u8>>)>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    submitted: u64,
+    written: u64,
+    ready: std::collections::BTreeMap<u64, io::Result<Vec<u8>>>,
+}
+
+impl<W: Write> ParallelEncoder<W> {
+    fn new(out: W, threads: u32, compress: impl Fn(&[u8]) -> io::Result<Vec<u8>> + Send + Sync + 'static) -> Self {
+        let threads = threads.max(1) as usize;
+        let compress: std::sync::Arc<ChunkFn> = std::sync::Arc::new(compress);
+        // The queue bound keeps at most a few chunks per thread in memory.
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(threads * 2);
+        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+        let (result_tx, results) = std::sync::mpsc::channel();
+        let workers = (0..threads)
+            .filter_map(|i| {
+                let (jobs, results, compress) = (job_rx.clone(), result_tx.clone(), compress.clone());
+                std::thread::Builder::new()
+                    .name(format!("oxide-compress-{i}"))
+                    .spawn(move || {
+                        loop {
+                            let job = jobs.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            let Ok((seq, data)) = job else { return };
+                            if results.send((seq, compress(&data))).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .ok()
+            })
+            .collect();
+        ParallelEncoder {
+            out,
+            chunk: Vec::with_capacity(PARALLEL_CHUNK),
+            jobs: Some(job_tx),
+            results,
+            workers,
+            submitted: 0,
+            written: 0,
+            ready: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn submit_chunk(&mut self) -> io::Result<()> {
+        let data = std::mem::replace(&mut self.chunk, Vec::with_capacity(PARALLEL_CHUNK));
+        let seq = self.submitted;
+        self.submitted += 1;
+        if self.workers.is_empty() {
+            return Err(io::Error::other("could not start compression threads"));
+        }
+        let sent = self.jobs.as_ref().is_some_and(|tx| tx.send((seq, data)).is_ok());
+        if !sent {
+            return Err(io::Error::other("compression threads stopped"));
+        }
+        self.write_ready(false)
+    }
+
+    /// Writes finished chunks in order; with `wait`, until all are written.
+    fn write_ready(&mut self, wait: bool) -> io::Result<()> {
+        loop {
+            while let Some(result) = self.ready.remove(&self.written) {
+                self.out.write_all(&result?)?;
+                self.written += 1;
+            }
+            if self.written == self.submitted {
+                return Ok(());
+            }
+            let next = if wait { self.results.recv().ok() } else { self.results.try_recv().ok() };
+            match next {
+                Some((seq, result)) => {
+                    self.ready.insert(seq, result);
+                }
+                None if wait => return Err(io::Error::other("compression threads stopped")),
+                None => return Ok(()),
+            }
+        }
+    }
+}
+
+impl<W: Write> Write for ParallelEncoder<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = buf.len().min(PARALLEL_CHUNK - self.chunk.len());
+        self.chunk.extend_from_slice(&buf[..n]);
+        if self.chunk.len() == PARALLEL_CHUNK {
+            self.submit_chunk()?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Chunks are only complete once full; `finish` writes the remainder.
+        self.out.flush()
+    }
+}
+
+impl<W: Write> FinishWrite for ParallelEncoder<W> {
+    fn finish(mut self: Box<Self>) -> io::Result<()> {
+        // Always emit at least one member so empty input is still a valid file.
+        if !self.chunk.is_empty() || self.submitted == 0 {
+            self.submit_chunk()?;
+        }
+        self.write_ready(true)?;
+        self.jobs = None;
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+        self.out.flush()
+    }
+}
+
+impl<W: Write> Drop for ParallelEncoder<W> {
+    fn drop(&mut self) {
+        self.jobs = None;
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// Pass-through for uncompressed TAR.
 pub(crate) struct Plain<W: Write>(pub W);
 
@@ -498,6 +644,16 @@ impl Codec {
     ) -> Result<Box<dyn FinishWrite + 'w>> {
         let level_u = level.max(0) as u32;
         Ok(match self {
+            Codec::Gzip if threads > 1 => Box::new(ParallelEncoder::new(writer, threads, move |chunk: &[u8]| {
+                let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level_u));
+                enc.write_all(chunk)?;
+                enc.finish()
+            })),
+            Codec::Bzip2 if threads > 1 => Box::new(ParallelEncoder::new(writer, threads, move |chunk: &[u8]| {
+                let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::new(level_u.clamp(1, 9)));
+                enc.write_all(chunk)?;
+                enc.finish()
+            })),
             Codec::Gzip => Box::new(flate2::write::GzEncoder::new(writer, flate2::Compression::new(level_u))),
             Codec::Bzip2 => {
                 Box::new(bzip2::write::BzEncoder::new(writer, bzip2::Compression::new(level_u.clamp(1, 9))))

@@ -40,7 +40,7 @@ The macOS app is ad-hoc signed but not notarized. On first launch, right-click i
 You need Rust **1.95 or newer** (`rustup update stable`).
 
 ```bash
-git clone https://github.com/oxide-archiver/oxide && cd oxide
+git clone https://github.com/zenfy-dev/oxide && cd oxide
 cargo build --release
 ```
 
@@ -95,7 +95,13 @@ Ctrl+C cancels cleanly (temporary files are removed). Pressing it again exits im
 
 ## Desktop app
 
-Run `oxide-gui`, optionally with an archive path. You can:
+**On macOS, double-clicking an archive in Finder (or Open With → Oxide) extracts it without
+opening a window,** like Archive Utility. A single top-level item is placed next to the archive;
+several items go into a folder named after it. Existing names are never replaced ("Photos 2").
+The window only appears if the archive needs a password or can't be extracted. Open Oxide itself
+(Dock, Launchpad, Spotlight) to browse archives.
+
+Run `oxide-gui`, optionally with an archive path, to open it in the window. You can:
 
 - **Open** an archive (⌘/Ctrl+O, drag-and-drop, or as a file association) and browse it like a
   folder. Use breadcrumbs, back/up (Backspace), and double-click to enter folders.

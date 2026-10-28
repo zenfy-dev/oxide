@@ -87,7 +87,7 @@ At most one job runs at a time. `PasswordRequired`/`WrongPassword` raise a promp
 the last `Action` with the new password. Panics in a worker are caught and reported as errors.
 
 The GUI is split into `app.rs` (state, actions, jobs), `ui.rs` (layout, toolbar, modals,
-shortcuts, drag-and-drop), `theme.rs` (visuals and the procedurally drawn icon) and
+shortcuts, drag-and-drop), `theme.rs` (visuals and the embedded app icon) and
 `components/` (file table and folder tree, create/extract dialogs, progress modal).
 `devtools.rs` exists only in debug builds and lets the app screenshot itself for documentation.
 

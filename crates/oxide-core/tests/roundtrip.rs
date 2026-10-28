@@ -78,7 +78,7 @@ fn sevenz_store_and_multithreaded() {
 
 #[test]
 fn compressed_tars_multithreaded_and_single_threaded() {
-    for format in [ArchiveFormat::TarZst, ArchiveFormat::TarXz] {
+    for format in [ArchiveFormat::TarZst, ArchiveFormat::TarXz, ArchiveFormat::TarGz, ArchiveFormat::TarBz2] {
         for threads in [1, 4] {
             roundtrip(format, CreateOptions { threads, ..Default::default() }, None);
         }

@@ -2,14 +2,16 @@
 //! (used for documentation and visual checks; compiled out of release builds).
 //!
 //! `OXIDE_SCREENSHOT=out.bmp` saves the window after a few frames and exits.
-//! `OXIDE_DEMO=create|extract|select|test` opens a dialog, selects rows or starts a test;
-//! `OXIDE_THEME=light|dark` forces a theme; `OXIDE_PASSWORD` answers the password prompt.
+//! `OXIDE_DEMO=create|extract|select|test|quit` opens a dialog, selects rows or starts a test;
+//! `OXIDE_THEME=light|dark` forces a theme; `OXIDE_PASSWORD` answers the password prompt;
+//! `OXIDE_RECENT=a.zip:b.7z` seeds the recent list.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static TEST_STARTED: AtomicBool = AtomicBool::new(false);
+static RECENT_SEEDED: AtomicBool = AtomicBool::new(false);
 
 use eframe::egui;
 
@@ -32,6 +34,11 @@ pub fn from_env(ctx: &egui::Context) -> Option<Capture> {
 }
 
 pub fn apply_demo(app: &mut OxideApp, ctx: &egui::Context) {
+    if let Ok(list) = std::env::var("OXIDE_RECENT")
+        && !RECENT_SEEDED.swap(true, Ordering::Relaxed)
+    {
+        app.recent = std::env::split_paths(&list).collect();
+    }
     if app.password_prompt.is_some()
         && let Ok(pw) = std::env::var("OXIDE_PASSWORD")
     {
@@ -48,6 +55,10 @@ pub fn apply_demo(app: &mut OxideApp, ctx: &egui::Context) {
         }
         Ok("test") if app.archive.is_some() && !app.busy() && !TEST_STARTED.swap(true, Ordering::Relaxed) => {
             app.test_archive(ctx);
+        }
+        // Closes the window normally once an archive is open, so settings are saved.
+        Ok("quit") if app.archive.is_some() && !app.busy() => {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         Ok("select") if app.archive.as_ref().is_some_and(|a| a.selection.is_empty() && !a.rows.is_empty()) => {
             if let Some(a) = &mut app.archive {

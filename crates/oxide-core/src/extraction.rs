@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
@@ -56,6 +57,14 @@ pub enum SymlinkPolicy {
     /// Never create links.
     Skip,
 }
+
+/// Size of the reusable copy buffer used while extracting.
+const COPY_BUFFER: usize = 256 * 1024;
+
+/// Files up to this size are written by the background writer pool.
+const POOLED_FILE_MAX: u64 = 1024 * 1024;
+/// Writer threads. File creation stops scaling at about four on APFS.
+const MAX_WRITERS: usize = 4;
 
 /// Resource limits that protect against decompression bombs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -277,6 +286,17 @@ pub(crate) struct ExtractVisitor<'a> {
     entries_seen: u64,
     total_written: u64,
     written: HashSet<PathBuf>,
+    /// Directories (relative to the root) already verified or created, so
+    /// thousands of files in one folder don't re-check every parent.
+    /// Safe to cache: links are only created after all files are written.
+    checked_dirs: HashSet<PathBuf>,
+    /// Copy buffer reused for every file.
+    buf: Vec<u8>,
+    /// Background writers for small files, started on first use.
+    pool: Option<WriterPool>,
+    /// Final paths handed to the writer pool that may not exist on disk yet,
+    /// keyed by [`name_key`] so case-only clashes are seen on macOS/Windows.
+    reserved: HashSet<PathBuf>,
     links: Vec<PendingLink>,
     dir_times: Vec<(PathBuf, SystemTime)>,
     stripped_absolute: bool,
@@ -298,6 +318,10 @@ impl<'a> ExtractVisitor<'a> {
             entries_seen: 0,
             total_written: 0,
             written: HashSet::new(),
+            checked_dirs: HashSet::new(),
+            buf: vec![0u8; COPY_BUFFER],
+            pool: None,
+            reserved: HashSet::new(),
             links: Vec::new(),
             dir_times: Vec::new(),
             stripped_absolute: false,
@@ -361,12 +385,40 @@ impl<'a> ExtractVisitor<'a> {
         Ok(())
     }
 
-    /// Creates every directory along `rel` under the root, refusing to
-    /// traverse an existing symbolic link or to replace a non-directory.
-    fn ensure_dir(&self, rel: &Path) -> Result<PathBuf> {
+    /// Fails if any existing component of `rel` (under the root) is a symbolic
+    /// link. Unlike [`Self::ensure_dir`], creates nothing.
+    fn check_no_symlinks(&self, rel: &Path) -> Result<()> {
         let mut current = self.root.clone();
         for component in rel.components() {
             current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(OxideError::UnsafePath {
+                        path: rel.display().to_string(),
+                        reason: "a path component is a symbolic link",
+                    });
+                }
+                Ok(_) => {}
+                Err(_) => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates every directory along `rel` under the root, refusing to
+    /// traverse an existing symbolic link or to replace a non-directory.
+    fn ensure_dir(&mut self, rel: &Path) -> Result<PathBuf> {
+        if self.checked_dirs.contains(rel) {
+            return Ok(self.root.join(rel));
+        }
+        let mut current = self.root.clone();
+        let mut so_far = PathBuf::new();
+        for component in rel.components() {
+            current.push(component);
+            so_far.push(component);
+            if self.checked_dirs.contains(&so_far) {
+                continue;
+            }
             match fs::symlink_metadata(&current) {
                 Ok(meta) if meta.file_type().is_symlink() => {
                     return Err(OxideError::UnsafePath {
@@ -388,6 +440,7 @@ impl<'a> ExtractVisitor<'a> {
                 },
                 Err(e) => return Err(OxideError::io(&current, e)),
             }
+            self.checked_dirs.insert(so_far.clone());
         }
         Ok(current)
     }
@@ -396,6 +449,8 @@ impl<'a> ExtractVisitor<'a> {
     /// policy. Returns `None` if the entry should be skipped.
     fn resolve_target(&mut self, rel: &Path) -> Result<Option<(PathBuf, bool)>> {
         let target = self.root.join(rel);
+        let reserved = &self.reserved;
+        let taken = |p: &Path| reserved.contains(&name_key(p)) || fs::symlink_metadata(p).is_ok();
         let exists = match fs::symlink_metadata(&target) {
             Ok(meta) => {
                 if meta.is_dir() {
@@ -406,7 +461,7 @@ impl<'a> ExtractVisitor<'a> {
                 }
                 true
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => self.reserved.contains(&name_key(&target)),
             Err(e) => return Err(OxideError::io(&target, e)),
         };
         // An archive may legitimately contain the same path twice (e.g. an
@@ -418,64 +473,127 @@ impl<'a> ExtractVisitor<'a> {
             OverwritePolicy::Error => Err(OxideError::AlreadyExists(target)),
             OverwritePolicy::Skip => Ok(None),
             OverwritePolicy::Overwrite => Ok(Some((target, true))),
-            OverwritePolicy::Rename => Ok(Some((unique_name(&target), false))),
+            OverwritePolicy::Rename => Ok(Some((unique_name(&target, taken), false))),
         }
     }
 
     fn write_file(&mut self, entry: &Entry, rel: &Path, data: &mut dyn Read) -> Result<()> {
+        // A later copy of a path must not race an earlier one still being written.
+        if self.written.contains(rel) {
+            self.flush_writes()?;
+        }
         let parent_rel = rel.parent().unwrap_or(Path::new(""));
         let parent = self.ensure_dir(parent_rel)?;
         let Some((target, replace)) = self.resolve_target(rel)? else {
             self.summary.skipped += 1;
             return Ok(());
         };
+        let meta = FileMeta {
+            mode: entry.mode.filter(|_| self.options.preserve_permissions),
+            mtime: entry.modified.filter(|_| self.options.preserve_mtime).and_then(unix_to_system_time),
+        };
 
-        let mut tmp = tempfile::Builder::new().prefix(".oxide-").suffix(".part").tempfile_in(&parent).at(&parent)?;
-        let mut buf = vec![0u8; 256 * 1024];
-        let mut entry_bytes = 0u64;
-        {
-            let mut out = io::BufWriter::with_capacity(256 * 1024, tmp.as_file_mut());
-            loop {
-                self.tracker.check_cancel()?;
-                let n = match data.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(self.decode_error(e, entry)),
-                };
-                entry_bytes += n as u64;
-                self.total_written += n as u64;
-                self.check_written(entry_bytes, &entry.path)?;
-                out.write_all(&buf[..n]).at(&target)?;
-                self.tracker.add_bytes(n as u64);
-            }
-            out.flush().at(&target)?;
-        }
-
-        let file = tmp.as_file();
-        #[cfg(unix)]
-        if self.options.preserve_permissions
-            && let Some(mode) = entry.mode
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Never restore setuid/setgid/sticky bits from untrusted input.
-            let _ = file.set_permissions(fs::Permissions::from_mode(mode & 0o777));
-        }
-        if self.options.preserve_mtime
-            && let Some(t) = entry.modified.and_then(unix_to_system_time)
-        {
-            let _ = file.set_modified(t);
-        }
-
-        let persisted = if replace { tmp.persist(&target) } else { tmp.persist_noclobber(&target) };
-        persisted.map_err(|e| match e.error.kind() {
-            io::ErrorKind::AlreadyExists => OxideError::AlreadyExists(target.clone()),
-            _ => OxideError::io(&target, e.error),
-        })?;
+        self.reserved.insert(name_key(&target));
+        let mut buf = std::mem::take(&mut self.buf);
+        let result = self.write_contents(entry, &parent, &target, replace, meta, data, &mut buf);
+        self.buf = buf;
+        let entry_bytes = result?;
         self.written.insert(rel.to_path_buf());
         self.summary.files += 1;
         self.summary.bytes += entry_bytes;
         Ok(())
+    }
+
+    /// Small files are read into memory and written by the writer pool (file
+    /// creation, not decoding, dominates for them); anything larger, or that
+    /// turns out larger than declared, is streamed to disk here.
+    #[allow(clippy::too_many_arguments)]
+    fn write_contents(
+        &mut self,
+        entry: &Entry,
+        parent: &Path,
+        target: &Path,
+        replace: bool,
+        meta: FileMeta,
+        data: &mut dyn Read,
+        buf: &mut [u8],
+    ) -> Result<u64> {
+        let mut head = Vec::new();
+        if entry.size.is_some_and(|s| s <= POOLED_FILE_MAX) {
+            let mut entry_bytes = 0u64;
+            loop {
+                let n = self.read_chunk(entry, data, buf, &mut entry_bytes)?;
+                if n == 0 {
+                    let rename_on_clash = self.options.overwrite == OverwritePolicy::Rename;
+                    self.pool().submit(WriteJob {
+                        parent: parent.to_path_buf(),
+                        target: target.to_path_buf(),
+                        replace,
+                        rename_on_clash,
+                        data: head,
+                        meta,
+                    })?;
+                    return Ok(entry_bytes);
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.len() as u64 > POOLED_FILE_MAX {
+                    break; // larger than declared: fall back to streaming
+                }
+            }
+        }
+
+        let mut tmp = tempfile::Builder::new().prefix(".oxide-").suffix(".part").tempfile_in(parent).at(parent)?;
+        let mut entry_bytes = head.len() as u64;
+        {
+            // Some decoders (ZIP's) return small chunks; batch them into large writes.
+            let mut out = io::BufWriter::with_capacity(COPY_BUFFER, tmp.as_file_mut());
+            out.write_all(&head).at(target)?;
+            loop {
+                let n = self.read_chunk(entry, data, buf, &mut entry_bytes)?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n]).at(target)?;
+            }
+            out.flush().at(target)?;
+        }
+        finalize(tmp, target, replace, meta)?;
+        Ok(entry_bytes)
+    }
+
+    /// Reads one chunk, enforcing limits and reporting progress.
+    fn read_chunk(
+        &mut self,
+        entry: &Entry,
+        data: &mut dyn Read,
+        buf: &mut [u8],
+        entry_bytes: &mut u64,
+    ) -> Result<usize> {
+        loop {
+            self.tracker.check_cancel()?;
+            let n = match data.read(buf) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(self.decode_error(e, entry)),
+            };
+            *entry_bytes += n as u64;
+            self.total_written += n as u64;
+            self.check_written(*entry_bytes, &entry.path)?;
+            self.tracker.add_bytes(n as u64);
+            return Ok(n);
+        }
+    }
+
+    fn pool(&mut self) -> &mut WriterPool {
+        self.pool.get_or_insert_with(WriterPool::new)
+    }
+
+    /// Waits for queued writes and reports the first failure, if any.
+    fn flush_writes(&mut self) -> Result<()> {
+        match &mut self.pool {
+            Some(pool) => pool.flush(),
+            None => Ok(()),
+        }
     }
 
     fn decode_error(&self, err: io::Error, entry: &Entry) -> OxideError {
@@ -492,15 +610,15 @@ impl<'a> ExtractVisitor<'a> {
     }
 
     fn write_hardlink(&mut self, entry: &Entry, rel: &Path) -> Result<()> {
+        // The link's target may still be queued in the writer pool.
+        self.flush_writes()?;
         let raw_target = entry.link_target.as_deref().unwrap_or_default();
         let Some(target_rel) = sanitize_entry_path(raw_target)? else {
             return Err(OxideError::UnsafePath { path: entry.path.clone(), reason: "hard link has an empty target" });
         };
         let source = self.root.join(&target_rel);
         // The source must be a regular file we can reach without symlinks.
-        if let Some(parent) = target_rel.parent() {
-            self.ensure_dir(parent)?;
-        }
+        self.check_no_symlinks(&target_rel)?;
         match fs::symlink_metadata(&source) {
             Ok(m) if m.is_file() => {}
             _ => {
@@ -530,6 +648,7 @@ impl<'a> ExtractVisitor<'a> {
 
     /// Creates deferred symbolic links and verifies none escapes the root.
     pub(crate) fn finish(&mut self) -> Result<()> {
+        self.flush_writes()?;
         let links = std::mem::take(&mut self.links);
         let mut created = Vec::new();
         for link in links {
@@ -617,8 +736,11 @@ impl EntryVisitor for ExtractVisitor<'_> {
         let Some(rel) = sanitize_entry_path(&entry.path)? else {
             return Ok(());
         };
-        let trimmed = entry.path.trim_start_matches(['/', '\\']);
-        if trimmed.len() != entry.path.len() || entry.path.get(1..2) == Some(":") {
+        // Matches what `sanitize_entry_path` strips: a leading separator or a
+        // first component that is exactly a drive letter like `C:`.
+        let first = entry.path.split(['/', '\\']).next().unwrap_or_default();
+        let drive = first.len() == 2 && first.ends_with(':') && first.as_bytes()[0].is_ascii_alphabetic();
+        if entry.path.starts_with(['/', '\\']) || drive {
             self.stripped_absolute = true;
         }
         self.tracker.start_entry(&entry.path);
@@ -657,12 +779,170 @@ impl EntryVisitor for ExtractVisitor<'_> {
     }
 }
 
-fn unique_name(target: &Path) -> PathBuf {
+#[derive(Clone, Copy)]
+struct FileMeta {
+    mode: Option<u32>,
+    mtime: Option<SystemTime>,
+}
+
+/// Applies metadata and moves a finished temporary file to its final name.
+fn finalize(tmp: tempfile::NamedTempFile, target: &Path, replace: bool, meta: FileMeta) -> Result<()> {
+    let file = tmp.as_file();
+    #[cfg(unix)]
+    if let Some(mode) = meta.mode {
+        use std::os::unix::fs::PermissionsExt;
+        // Never restore setuid/setgid/sticky bits from untrusted input.
+        let _ = file.set_permissions(fs::Permissions::from_mode(mode & 0o777));
+    }
+    if let Some(t) = meta.mtime {
+        let _ = file.set_modified(t);
+    }
+    let persisted = if replace { tmp.persist(target) } else { tmp.persist_noclobber(target) };
+    persisted.map_err(|e| match e.error.kind() {
+        io::ErrorKind::AlreadyExists => OxideError::AlreadyExists(target.to_path_buf()),
+        _ => OxideError::io(target, e.error),
+    })?;
+    Ok(())
+}
+
+/// A file fully decided on by the extractor (path checked, policy applied),
+/// waiting to be written.
+struct WriteJob {
+    parent: PathBuf,
+    target: PathBuf,
+    replace: bool,
+    /// Under the rename policy, pick another free name if the target turns up taken.
+    rename_on_clash: bool,
+    data: Vec<u8>,
+    meta: FileMeta,
+}
+
+impl WriteJob {
+    fn run(self) -> Result<()> {
+        let mut tmp =
+            tempfile::Builder::new().prefix(".oxide-").suffix(".part").tempfile_in(&self.parent).at(&self.parent)?;
+        tmp.as_file_mut().write_all(&self.data).at(&self.target)?;
+        match finalize(tmp, &self.target, self.replace, self.meta) {
+            Err(OxideError::AlreadyExists(_)) if self.rename_on_clash => {
+                let target = unique_name(&self.target, |p| fs::symlink_metadata(p).is_ok());
+                WriteJob { target, rename_on_clash: false, ..self }.run()
+            }
+            other => other,
+        }
+    }
+}
+
+/// A few threads that create small files concurrently. Creating a file costs
+/// far more than writing a few kilobytes, and filesystems handle several
+/// creations at once much faster than one after another.
+struct WriterPool {
+    jobs: Option<mpsc::SyncSender<WriteJob>>,
+    results: mpsc::Receiver<Result<()>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    pending: usize,
+    failed: Option<OxideError>,
+}
+
+impl WriterPool {
+    fn new() -> Self {
+        let count = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, MAX_WRITERS);
+        // A short queue bounds memory to a few megabytes of pending files.
+        let (job_tx, job_rx) = mpsc::sync_channel::<WriteJob>(count * 2);
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let (result_tx, results) = mpsc::channel();
+        let workers = (0..count)
+            .filter_map(|i| {
+                let (jobs, results) = (job_rx.clone(), result_tx.clone());
+                std::thread::Builder::new()
+                    .name(format!("oxide-writer-{i}"))
+                    .spawn(move || {
+                        loop {
+                            let job = jobs.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                            let Ok(job) = job else { return };
+                            if results.send(job.run()).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .ok()
+            })
+            .collect();
+        WriterPool { jobs: Some(job_tx), results, workers, pending: 0, failed: None }
+    }
+
+    fn submit(&mut self, job: WriteJob) -> Result<()> {
+        self.collect(false);
+        if let Some(e) = self.failed.take() {
+            return Err(e);
+        }
+        if self.workers.is_empty() {
+            return job.run(); // no threads could be started: write inline
+        }
+        match &self.jobs {
+            Some(tx) if tx.send(job).is_ok() => {
+                self.pending += 1;
+                Ok(())
+            }
+            _ => Err(OxideError::from(io::Error::other("file writer threads stopped"))),
+        }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.collect(true);
+        self.failed.take().map_or(Ok(()), Err)
+    }
+
+    /// Gathers finished results; with `wait`, until nothing is pending.
+    fn collect(&mut self, wait: bool) {
+        while self.pending > 0 {
+            let result = if wait {
+                match self.results.recv() {
+                    Ok(r) => r,
+                    Err(_) => break,
+                }
+            } else {
+                match self.results.try_recv() {
+                    Ok(r) => r,
+                    Err(_) => break,
+                }
+            };
+            self.pending -= 1;
+            if let Err(e) = result
+                && self.failed.is_none()
+            {
+                self.failed = Some(e);
+            }
+        }
+    }
+}
+
+impl Drop for WriterPool {
+    fn drop(&mut self) {
+        // Closing the queue lets workers finish what was handed to them and exit.
+        self.jobs = None;
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Key for comparing file names the way the platform's default filesystem
+/// does: case-insensitively on macOS and Windows.
+fn name_key(path: &Path) -> PathBuf {
+    if cfg!(any(target_os = "macos", windows)) {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// `name (1).ext`, `name (2).ext`, ... — the first one `taken` rejects.
+fn unique_name(target: &Path, taken: impl Fn(&Path) -> bool) -> PathBuf {
     let stem = target.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let ext = target.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     for n in 1.. {
         let candidate = target.with_file_name(format!("{stem} ({n}){ext}"));
-        if fs::symlink_metadata(&candidate).is_err() {
+        if !taken(&candidate) {
             return candidate;
         }
     }

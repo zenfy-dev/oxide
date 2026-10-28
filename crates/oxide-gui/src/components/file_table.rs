@@ -8,6 +8,7 @@ use eframe::egui::{self, Align, Layout, RichText, Sense};
 use egui_extras::{Column, TableBuilder};
 use oxide_core::{Entry, EntryKind};
 
+use super::icons::{self, Icon};
 use super::{format_time, human_bytes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -122,6 +123,11 @@ impl Tree {
         Tree { children, all }
     }
 
+    /// Every folder, including ones only implied by file paths.
+    pub fn dir_count(&self) -> usize {
+        self.children.len().saturating_sub(1) // minus the root
+    }
+
     pub fn children(&self, dir: &str) -> &[Row] {
         self.children.get(dir).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -215,13 +221,19 @@ pub fn show(
     anchor: &mut Option<usize>,
     sort: SortKey,
     ascending: bool,
+    scroll_to: Option<usize>,
 ) -> TableEvents {
     let mut events = TableEvents::default();
     let weak = crate::theme::weak(ui);
     let modifiers = ui.input(|i| i.modifiers);
     let arrow = if ascending { " ⏶" } else { " ⏷" };
 
-    TableBuilder::new(ui)
+    let folder_color = crate::theme::ACCENT.gamma_multiply(0.85);
+    let mut table = TableBuilder::new(ui);
+    if let Some(i) = scroll_to {
+        table = table.scroll_to_row(i, None);
+    }
+    table
         .striped(true)
         .sense(Sense::click())
         .cell_layout(Layout::left_to_right(Align::Center))
@@ -239,7 +251,14 @@ pub fn show(
             ] {
                 header.col(|ui| {
                     let text = if sort == key { format!("{label}{arrow}") } else { label.to_owned() };
-                    if ui.add(egui::Button::new(RichText::new(text).strong()).frame(false)).clicked() {
+                    let button = egui::Button::new(RichText::new(text).strong()).frame(false);
+                    // Sizes are right-aligned, so their heading is too.
+                    let clicked = if key == SortKey::Size {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.add(button)).inner.clicked()
+                    } else {
+                        ui.add(button).clicked()
+                    };
+                    if clicked {
                         events.sort = Some(key);
                     }
                 });
@@ -251,22 +270,30 @@ pub fn show(
                 let r = &rows[i];
                 row.set_selected(selection.contains(&r.path));
                 row.col(|ui| {
-                    let icon = if r.is_dir {
-                        "📁"
+                    let (icon, color) = if r.is_dir {
+                        (Icon::Folder, folder_color)
                     } else if r.link.is_some() {
-                        "🔗"
+                        (Icon::Link, weak)
                     } else {
-                        "📄"
+                        (Icon::File, weak)
                     };
-                    ui.label(icon);
-                    let mut name = RichText::new(&r.name);
-                    if r.is_dir {
-                        name = name.strong();
-                    }
-                    ui.add(egui::Label::new(name).selectable(false).truncate());
-                    if r.encrypted {
-                        ui.label(RichText::new("🔒").small()).on_hover_text("Encrypted");
-                    }
+                    icons::show(ui, icon, color);
+                    // Lock pinned to the right; the name truncates in the remaining space.
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if r.encrypted {
+                            icons::show(ui, Icon::Lock, weak).on_hover_text("Encrypted");
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            let mut name = RichText::new(&r.name);
+                            if r.is_dir {
+                                name = name.strong();
+                            }
+                            let label = ui.add(egui::Label::new(name).selectable(false).truncate());
+                            if let Some(target) = &r.link {
+                                label.on_hover_text(format!("Link to {target}"));
+                            }
+                        });
+                    });
                 });
                 row.col(|ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -367,6 +394,7 @@ mod tests {
         assert_eq!(tree.children("a").len(), 2);
         assert_eq!(tree.children("a/b")[0].name, "c.txt");
         assert_eq!(tree.search("C.TXT").len(), 1);
+        assert_eq!(tree.dir_count(), 2, "a and the implied a/b");
         assert_eq!(tree.single_root_dir(), None);
     }
 

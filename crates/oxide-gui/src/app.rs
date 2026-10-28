@@ -3,7 +3,7 @@
 //! Long operations run on a worker thread that calls straight into
 //! `oxide-core`; the UI thread only reads progress snapshots.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -25,7 +25,24 @@ pub enum JobKind {
     Extract,
     Test,
     Add,
+    /// Extract beside the archive (files opened from Finder).
+    QuickExtract,
 }
+
+/// Whether the window is shown, decided at launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// Window hidden until we know whether Finder handed us files.
+    Deciding(Instant),
+    /// Normal app with a window.
+    Window,
+    /// Launched by opening archives from Finder: extract them, then quit.
+    /// The window only appears if a password or an error needs the user.
+    Background,
+}
+
+/// How long to wait at launch for Finder's "open" message before showing the window.
+const LAUNCH_GRACE: Duration = Duration::from_millis(150);
 
 pub enum JobOutput {
     Listing(ArchiveInfo),
@@ -59,6 +76,7 @@ pub enum Action {
     Open(PathBuf),
     Extract { archive: PathBuf, dest: PathBuf, options: ExtractOptions },
     Test(PathBuf),
+    QuickExtract(PathBuf),
 }
 
 pub struct OpenArchive {
@@ -72,6 +90,8 @@ pub struct OpenArchive {
     pub ascending: bool,
     pub rows: Vec<Row>,
     pub rows_key: Option<(String, String, SortKey, bool)>,
+    /// Row to scroll into view on the next frame (keyboard navigation).
+    pub scroll_to: Option<usize>,
 }
 
 impl OpenArchive {
@@ -90,6 +110,7 @@ impl OpenArchive {
             ascending: true,
             rows: Vec::new(),
             rows_key: None,
+            scroll_to: None,
         }
     }
 
@@ -145,6 +166,17 @@ pub struct PasswordPrompt {
     pub wrong: bool,
 }
 
+/// Remembered between launches.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Settings {
+    theme: String,
+    recent: Vec<PathBuf>,
+}
+
+const SETTINGS_KEY: &str = "oxide.settings";
+const MAX_RECENT: usize = 8;
+
 pub struct OxideApp {
     pub archive: Option<OpenArchive>,
     pub job: Option<Job>,
@@ -161,12 +193,26 @@ pub struct OxideApp {
     pub search: String,
     pub focus_search: bool,
     pub theme: egui::ThemePreference,
+    /// Recently opened archives, newest first.
+    pub recent: Vec<PathBuf>,
+    /// The app icon as a texture, for the empty state.
+    pub icon: Option<egui::TextureHandle>,
+    pub mode: LaunchMode,
+    /// Archives opened from Finder, waiting to be extracted.
+    pub quick_queue: VecDeque<PathBuf>,
     #[cfg(debug_assertions)]
     capture: Option<crate::devtools::Capture>,
 }
 
 impl OxideApp {
-    pub fn new(ctx: &egui::Context, initial: Option<PathBuf>) -> Self {
+    pub fn new(ctx: &egui::Context, storage: Option<&dyn eframe::Storage>, initial: Option<PathBuf>) -> Self {
+        let settings: Settings = storage.and_then(|s| eframe::get_value(s, SETTINGS_KEY)).unwrap_or_default();
+        let theme = match settings.theme.as_str() {
+            "light" => egui::ThemePreference::Light,
+            "dark" => egui::ThemePreference::Dark,
+            _ => egui::ThemePreference::System,
+        };
+        ctx.set_theme(theme);
         let mut app = OxideApp {
             archive: None,
             job: None,
@@ -181,10 +227,20 @@ impl OxideApp {
             last_action: None,
             search: String::new(),
             focus_search: false,
-            theme: egui::ThemePreference::System,
+            theme,
+            recent: settings.recent,
+            icon: None,
+            // Only macOS delivers opened files after launch; elsewhere the window shows at once.
+            mode: if cfg!(target_os = "macos") && initial.is_none() {
+                LaunchMode::Deciding(Instant::now())
+            } else {
+                LaunchMode::Window
+            },
+            quick_queue: VecDeque::new(),
             #[cfg(debug_assertions)]
             capture: crate::devtools::from_env(ctx),
         };
+        ctx.request_repaint();
         if let Some(path) = initial {
             if path.is_file() {
                 app.open_path(ctx, path);
@@ -263,6 +319,13 @@ impl OxideApp {
                         .map(|s| JobOutput::Summary(s, path))
                 });
             }
+            Action::QuickExtract(archive) => {
+                let title = format!("Extracting {}", file_name(&archive));
+                self.spawn(ctx, JobKind::QuickExtract, title, move |progress| {
+                    crate::quick_extract::extract_beside(&archive, password, progress)
+                        .map(|(s, target)| JobOutput::Summary(s, target))
+                });
+            }
             Action::Extract { archive, dest, mut options } => {
                 if options.password.is_none() {
                     options.password = password;
@@ -307,10 +370,60 @@ impl OxideApp {
             Ok(output) => self.job_succeeded(ctx, kind, output),
             Err(OxideError::Cancelled) => self.notify("Cancelled — nothing was left half-written"),
             Err(e @ (OxideError::PasswordRequired | OxideError::WrongPassword)) if self.last_action.is_some() => {
+                self.show_window(ctx);
                 self.password_prompt =
                     Some(PasswordPrompt { text: String::new(), wrong: matches!(e, OxideError::WrongPassword) });
             }
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => {
+                self.show_window(ctx);
+                let what = match (&self.last_action, kind) {
+                    (Some(Action::QuickExtract(path)), JobKind::QuickExtract) => {
+                        format!("Couldn't extract {}: ", file_name(path))
+                    }
+                    _ => String::new(),
+                };
+                self.error = Some(format!("{what}{e}"));
+            }
+        }
+    }
+
+    /// Makes the window visible (it starts hidden on macOS).
+    pub fn show_window(&mut self, ctx: &egui::Context) {
+        tracing::info!("showing window");
+        if matches!(self.mode, LaunchMode::Deciding(_)) {
+            self.mode = LaunchMode::Window;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Launch decision, Finder opens, and quitting after background extraction.
+    fn drive_launch(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        self.quick_queue.extend(crate::macos_open::take_opened());
+
+        if let LaunchMode::Deciding(started) = self.mode {
+            if !self.quick_queue.is_empty() {
+                self.mode = LaunchMode::Background;
+            } else if started.elapsed() >= LAUNCH_GRACE {
+                self.show_window(ctx);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(25));
+            }
+        }
+        if matches!(self.mode, LaunchMode::Deciding(_)) {
+            return;
+        }
+        let waiting_on_user = self.password_prompt.is_some() || self.error.is_some();
+        if !self.busy()
+            && !waiting_on_user
+            && let Some(next) = self.quick_queue.pop_front()
+        {
+            self.password = None;
+            self.run(ctx, Action::QuickExtract(next));
+        }
+        if self.mode == LaunchMode::Background && !self.busy() && !waiting_on_user && self.quick_queue.is_empty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -320,11 +433,21 @@ impl OxideApp {
                 tracing::info!(path = %info.path.display(), entries = info.entries.len(), "archive opened");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — Oxide", file_name(&info.path))));
                 self.search.clear();
+                self.remember(info.path.clone());
                 self.archive = Some(OpenArchive::new(info));
             }
             JobOutput::Summary(summary, target) => {
                 self.warnings = summary.warnings.clone();
                 match kind {
+                    JobKind::QuickExtract => {
+                        tracing::info!(target = %target.display(), files = summary.files, "extracted beside archive");
+                        // In the background there is no window to show warnings in.
+                        if self.mode == LaunchMode::Background {
+                            self.warnings.clear();
+                        } else {
+                            self.notify(format!("Extracted to {}", file_name(&target)));
+                        }
+                    }
                     JobKind::Extract => self.notify(format!(
                         "Extracted {} files ({}) to {}",
                         summary.files,
@@ -359,6 +482,18 @@ impl OxideApp {
             }
             self.run(ctx, action);
         }
+    }
+
+    fn remember(&mut self, path: PathBuf) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        self.recent.retain(|p| p != &path);
+        self.recent.insert(0, path);
+        self.recent.truncate(MAX_RECENT);
+    }
+
+    pub fn set_theme(&mut self, ctx: &egui::Context, theme: egui::ThemePreference) {
+        self.theme = theme;
+        ctx.set_theme(theme);
     }
 
     pub fn pick_and_open(&mut self, ctx: &egui::Context) {
@@ -399,7 +534,11 @@ impl OxideApp {
     /// Dropped files: archives open; anything else starts a new archive (or
     /// offers to add to the open one).
     pub fn handle_drop(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
-        if paths.is_empty() || self.busy() {
+        if paths.is_empty() {
+            return;
+        }
+        if self.busy() {
+            self.notify("Wait for the current operation to finish, then drop again");
             return;
         }
         if paths.len() == 1 && paths[0].is_file() && oxide_core::detect_format(&paths[0]).is_ok() {
@@ -418,22 +557,28 @@ pub fn file_name(path: &Path) -> String {
 }
 
 impl eframe::App for OxideApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let theme = match self.theme {
+            egui::ThemePreference::Light => "light",
+            egui::ThemePreference::Dark => "dark",
+            egui::ThemePreference::System => "system",
+        };
+        eframe::set_value(storage, SETTINGS_KEY, &Settings { theme: theme.into(), recent: self.recent.clone() });
+    }
+
+    /// Runs every frame, and also while the window is hidden.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_job(ctx);
+        self.drive_launch(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.poll_job(&ctx);
-        #[cfg(target_os = "macos")]
-        {
-            let opened = crate::macos_open::take_opened();
-            if !opened.is_empty() {
-                self.handle_drop(&ctx, opened);
-            }
-        }
         #[cfg(debug_assertions)]
-        crate::devtools::apply_demo(self, &ctx);
+        crate::devtools::apply_demo(self, &ui.ctx().clone());
         crate::ui::draw(self, ui);
         #[cfg(debug_assertions)]
         if let Some(capture) = &mut self.capture {
-            capture.tick(&ctx);
+            capture.tick(ui.ctx());
         }
     }
 }
