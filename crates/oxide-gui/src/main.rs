@@ -8,6 +8,7 @@ mod app;
 mod components;
 #[cfg(debug_assertions)]
 mod devtools;
+mod file_access;
 #[cfg(target_os = "macos")]
 mod macos_open;
 mod quick_extract;

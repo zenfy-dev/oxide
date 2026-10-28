@@ -2,7 +2,8 @@
 //! (used for documentation and visual checks; compiled out of release builds).
 //!
 //! `OXIDE_SCREENSHOT=out.bmp` saves the window after a few frames and exits.
-//! `OXIDE_DEMO=create|extract|select|test|quit` opens a dialog, selects rows or starts a test;
+//! `OXIDE_DEMO=create|extract|select|test|preview|quit` opens a dialog, selects rows or starts a test;
+//! `OXIDE_PREVIEW_ENTRY=path` picks an exact stored file path for the preview demo;
 //! `OXIDE_THEME=light|dark` forces a theme; `OXIDE_PASSWORD` answers the password prompt;
 //! `OXIDE_RECENT=a.zip:b.7z` seeds the recent list.
 
@@ -12,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static TEST_STARTED: AtomicBool = AtomicBool::new(false);
 static RECENT_SEEDED: AtomicBool = AtomicBool::new(false);
+static PREVIEW_STARTED: AtomicBool = AtomicBool::new(false);
 
 use eframe::egui;
 
@@ -62,6 +64,20 @@ pub fn apply_demo(app: &mut OxideApp, ctx: &egui::Context) {
         Ok("test") if app.archive.is_some() && !app.busy() && !TEST_STARTED.swap(true, Ordering::Relaxed) => {
             app.test_archive(ctx);
         }
+        Ok("preview") if app.archive.is_some() && !app.busy() && !PREVIEW_STARTED.swap(true, Ordering::Relaxed) => {
+            let path = std::env::var("OXIDE_PREVIEW_ENTRY").ok().or_else(|| {
+                app.archive
+                    .as_ref()?
+                    .info
+                    .entries
+                    .iter()
+                    .find(|e| e.kind == oxide_core::EntryKind::File)
+                    .map(|e| e.path.clone())
+            });
+            if let Some(path) = path {
+                app.open_entry(ctx, &path, crate::file_access::FileIntent::Preview);
+            }
+        }
         // Closes the window normally once an archive is open, so settings are saved.
         Ok("quit") if app.archive.is_some() && !app.busy() => {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -84,12 +100,14 @@ impl Capture {
         } else if !self.requested {
             self.requested = true;
             let path = self.path.clone();
+            let done = ctx.clone();
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(
                 move |image: Arc<egui::ColorImage>| {
                     if let Err(e) = write_bmp(&path, &image) {
                         eprintln!("screenshot failed: {e}");
                     }
-                    std::process::exit(0);
+                    // Exit normally so preview copies and textures are dropped.
+                    done.send_viewport_cmd(egui::ViewportCommand::Close);
                 },
             )));
             ctx.request_repaint();

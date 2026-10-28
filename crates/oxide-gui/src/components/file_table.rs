@@ -31,6 +31,8 @@ pub struct Row {
     pub kind: String,
     pub encrypted: bool,
     pub link: Option<String>,
+    /// Exact stored spelling for regular files; folders and links cannot launch.
+    pub file_path: Option<String>,
 }
 
 /// Folder → children index built once per opened archive.
@@ -99,6 +101,7 @@ impl Tree {
                             kind: "Folder".into(),
                             encrypted: false,
                             link: None,
+                            file_path: None,
                         });
                     }
                     if last && let Some(t) = e.modified {
@@ -117,6 +120,7 @@ impl Tree {
                         kind: kind_label(e, part),
                         encrypted: e.encrypted,
                         link: e.link_target.clone(),
+                        file_path: (e.kind == EntryKind::File).then(|| e.path.clone()),
                     };
                     all.push(SearchRow::from(row.clone()));
                     children.entry(parent.clone()).or_default().push(row);
@@ -217,6 +221,8 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
 #[derive(Default)]
 pub struct TableEvents {
     pub open_dir: Option<String>,
+    pub open_file: Option<String>,
+    pub preview_file: Option<String>,
     pub sort: Option<SortKey>,
     pub extract_selection: bool,
 }
@@ -335,8 +341,12 @@ pub fn show(
                         *anchor = Some(i);
                     }
                 }
-                if response.double_clicked() && r.is_dir {
-                    events.open_dir = Some(r.path.clone());
+                if response.double_clicked() {
+                    if r.is_dir {
+                        events.open_dir = Some(r.path.clone());
+                    } else {
+                        events.open_file = r.file_path.clone();
+                    }
                 }
                 response.context_menu(|ui| {
                     if !selection.contains(&r.path) {
@@ -346,6 +356,16 @@ pub fn show(
                     if r.is_dir && ui.button("Open folder").clicked() {
                         events.open_dir = Some(r.path.clone());
                         ui.close();
+                    }
+                    if let Some(path) = &r.file_path {
+                        if ui.button("Open in default app").clicked() {
+                            events.open_file = Some(path.clone());
+                            ui.close();
+                        }
+                        if ui.button("Preview").clicked() {
+                            events.preview_file = Some(path.clone());
+                            ui.close();
+                        }
                     }
                     let label = format!("Extract {} selected…", selection.len());
                     if ui.button(label).clicked() {
@@ -426,6 +446,21 @@ mod tests {
         assert_eq!(found[0].name, found[0].path);
         assert!(tree.search("Docs png").is_empty());
         assert_eq!(tree.search("docs NAÏVE").iter().filter(|r| r.is_dir).count(), 1);
+    }
+
+    #[test]
+    fn file_actions_keep_exact_stored_paths_and_exclude_links() {
+        let tree = Tree::build(&[
+            entry("./Docs//text.txt", EntryKind::File, 10),
+            entry("Docs/symbolic", EntryKind::Symlink, 4),
+            entry("Docs/hard", EntryKind::Hardlink, 0),
+        ]);
+        let rows = tree.children("Docs");
+        assert_eq!(rows[0].path, "Docs/text.txt");
+        assert_eq!(rows[0].file_path.as_deref(), Some("./Docs//text.txt"));
+        assert!(rows[1].file_path.is_none());
+        assert!(rows[2].file_path.is_none());
+        assert!(tree.children("")[0].file_path.is_none());
     }
 
     #[test]

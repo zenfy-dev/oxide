@@ -115,6 +115,10 @@ pub struct ExtractOptions {
     /// Only extract these archive paths (and, for directories, everything
     /// beneath them). `None` extracts everything.
     pub selection: Option<Vec<String>>,
+    /// Match selected entry names exactly instead of including descendants.
+    /// Exact names use the archive's stored spelling, including `./` prefixes.
+    /// Useful when opening one file without extracting any similarly named paths.
+    pub exact_selection: bool,
     /// Remove this many leading path components after validating each path.
     /// Entries with no remaining components are skipped. Selection uses the
     /// original archive paths, before stripping.
@@ -136,6 +140,7 @@ impl Default for ExtractOptions {
             symlinks: SymlinkPolicy::Contained,
             limits: ExtractLimits::default(),
             selection: None,
+            exact_selection: false,
             strip_components: 0,
             password: None,
             format: None,
@@ -321,8 +326,11 @@ pub(crate) struct ExtractVisitor<'a> {
 
 impl<'a> ExtractVisitor<'a> {
     pub(crate) fn new(root: PathBuf, options: &'a ExtractOptions, tracker: &'a Tracker<'a>, archive_len: u64) -> Self {
-        let selection =
-            options.selection.as_ref().map(|sel| sel.iter().map(|s| selection_path(s).into_owned()).collect());
+        let selection = options.selection.as_ref().map(|sel| {
+            sel.iter()
+                .map(|s| if options.exact_selection { s.clone() } else { selection_path(s).into_owned() })
+                .collect()
+        });
         ExtractVisitor {
             root,
             options,
@@ -347,6 +355,9 @@ impl<'a> ExtractVisitor<'a> {
         let Some(sel) = &self.selection else {
             return true;
         };
+        if self.options.exact_selection {
+            return sel.contains(&entry.path);
+        }
         if sel.contains("") {
             return true;
         }

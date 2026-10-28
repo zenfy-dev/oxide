@@ -7,6 +7,7 @@ use eframe::egui::{self, Align, Key, KeyboardShortcut, Layout, Modifiers, RichTe
 use crate::app::{OxideApp, file_name};
 use crate::components::icons::{self, Icon};
 use crate::components::{create_dialog, extract_dialog, file_table, human_bytes, progress};
+use crate::file_access::FileIntent;
 use crate::theme;
 
 const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
@@ -17,6 +18,7 @@ const ADD: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modi
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 const SELECT_ALL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::A);
 const UP: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowUp);
+const PREVIEW: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::P);
 
 pub fn draw(app: &mut OxideApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
@@ -44,7 +46,14 @@ pub fn draw(app: &mut OxideApp, ui: &mut egui::Ui) {
 
 fn shortcuts(app: &mut OxideApp, ctx: &egui::Context) {
     // Shortcuts are inert while a dialog or job owns the window.
-    if app.busy() || app.create.is_some() || app.extract.is_some() || app.password_prompt.is_some() {
+    if app.busy()
+        || app.create.is_some()
+        || app.extract.is_some()
+        || app.preview.is_some()
+        || app.password_prompt.is_some()
+        || app.error.is_some()
+        || app.drop_choice.is_some()
+    {
         return;
     }
     let pressed = |s: &KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(s));
@@ -63,6 +72,7 @@ fn shortcuts(app: &mut OxideApp, ctx: &egui::Context) {
         app.focus_search = true;
     }
     let typing = ctx.egui_wants_keyboard_input();
+    let mut open_file = None;
     if let Some(a) = &mut app.archive {
         if !typing && pressed(&SELECT_ALL) {
             a.selection = a.rows.iter().map(|r| r.path.clone()).collect();
@@ -92,11 +102,22 @@ fn shortcuts(app: &mut OxideApp, ctx: &egui::Context) {
             a.scroll_to = Some(next);
         }
         if !typing && ctx.input(|i| i.key_pressed(Key::Enter)) {
-            let target = a.rows.iter().find(|r| r.is_dir && a.selection.len() == 1 && a.selection.contains(&r.path));
-            if let Some(dir) = target.map(|r| r.path.clone()) {
-                a.navigate(dir);
+            let target = a.rows.iter().find(|r| a.selection.len() == 1 && a.selection.contains(&r.path));
+            if let Some(row) = target {
+                if row.is_dir {
+                    let path = row.path.clone();
+                    a.navigate(path);
+                    app.search.clear();
+                } else {
+                    open_file = row.file_path.clone();
+                }
             }
         }
+    }
+    if let Some(path) = open_file {
+        app.open_entry(ctx, &path, FileIntent::Open);
+    } else if !typing && (pressed(&PREVIEW) || ctx.input(|i| i.key_pressed(Key::Space) && i.modifiers.is_none())) {
+        app.preview_selected(ctx);
     }
     if ctx.input(|i| i.key_pressed(Key::Escape)) && !app.search.is_empty() {
         app.search.clear();
@@ -115,6 +136,7 @@ fn toolbar(app: &mut OxideApp, ui: &mut egui::Ui) {
     let idle = !app.busy();
     let has = app.archive.is_some() && idle;
     let can_add = has && app.archive.as_ref().is_some_and(|a| a.supports_add());
+    let can_preview = has && app.archive.as_ref().and_then(|a| a.selected_file()).is_some();
     let sc = |s: &KeyboardShortcut| ctx.format_shortcut(s);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
@@ -140,6 +162,15 @@ fn toolbar(app: &mut OxideApp, ui: &mut egui::Ui) {
         }
         if tool_button(ui, has, Icon::Test, "Test", format!("Verify the archive's integrity ({})", sc(&TEST))) {
             app.test_archive(&ctx);
+        }
+        if tool_button(
+            ui,
+            can_preview,
+            Icon::Preview,
+            "Preview",
+            format!("Preview selected file (Space / {})", sc(&PREVIEW)),
+        ) {
+            app.preview_selected(&ctx);
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -229,6 +260,12 @@ fn browser(app: &mut OxideApp, ui: &mut egui::Ui) {
     }
     if events.extract_selection {
         app.open_extract_dialog(true);
+    }
+    let ctx = ui.ctx().clone();
+    if let Some(path) = events.open_file {
+        app.open_entry(&ctx, &path, FileIntent::Open);
+    } else if let Some(path) = events.preview_file {
+        app.open_entry(&ctx, &path, FileIntent::Preview);
     }
 }
 
@@ -428,6 +465,23 @@ fn status_bar(app: &OxideApp, ui: &mut egui::Ui) {
 }
 
 fn dialogs(app: &mut OxideApp, ctx: &egui::Context) {
+    let busy = app.busy()
+        || app.password_prompt.is_some()
+        || app.error.is_some()
+        || app.create.is_some()
+        || app.extract.is_some()
+        || app.drop_choice.is_some()
+        || !app.warnings.is_empty();
+    if let Some(preview) = &mut app.preview {
+        let events = preview.show(ctx, busy);
+        let file = events.open.then(|| preview.file.clone());
+        if events.close {
+            app.preview = None;
+        }
+        if let Some(file) = file {
+            app.open_staged(ctx, file);
+        }
+    }
     if let Some(dialog) = &mut app.create {
         match dialog.show(ctx) {
             create_dialog::Outcome::Open => {}

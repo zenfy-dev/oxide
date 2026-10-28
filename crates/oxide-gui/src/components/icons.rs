@@ -16,6 +16,7 @@ pub enum Icon {
     Back,
     Up,
     Search,
+    Preview,
     Close,
     Folder,
     File,
@@ -48,6 +49,19 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     };
 
     match icon {
+        Icon::Preview => {
+            closed(&[
+                (1.0, 8.0),
+                (3.5, 4.5),
+                (8.0, 2.5),
+                (12.5, 4.5),
+                (15.0, 8.0),
+                (12.5, 11.5),
+                (8.0, 13.5),
+                (3.5, 11.5),
+            ]);
+            painter.circle_stroke(p(8.0, 8.0), 2.5 * s, stroke);
+        }
         Icon::Open => {
             line(&[(1.5, 13.0), (1.5, 3.0), (6.0, 3.0), (7.5, 4.5), (13.0, 4.5), (13.0, 7.0)]);
             closed(&[(1.5, 13.0), (4.0, 7.0), (15.0, 7.0), (12.5, 13.0)]);

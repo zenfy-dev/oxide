@@ -451,6 +451,7 @@ fn run(cli: Cli, cancel: &CancelToken) -> anyhow::Result<()> {
                 symlinks: if args.no_symlinks { SymlinkPolicy::Skip } else { SymlinkPolicy::Contained },
                 limits,
                 selection: (!args.only.is_empty()).then_some(args.only),
+                exact_selection: false,
                 strip_components: args.strip_components,
                 password: args.read.password.get()?,
                 format: args.read.format,

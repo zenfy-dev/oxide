@@ -75,6 +75,29 @@ fn stripping_components_cannot_hide_traversal() {
 }
 
 #[test]
+fn exact_selection_does_not_extract_descendants_or_normalized_aliases() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("single.zip");
+    write_zip(
+        &archive,
+        &[
+            ("report.txt", b"selected"),
+            ("report.txt/../../outside.txt", b"must never be decoded"),
+            ("./report.txt", b"different stored name"),
+            ("other.txt", b"unselected"),
+        ],
+    );
+    let out = tmp.path().join("out");
+    let options =
+        ExtractOptions { selection: Some(vec!["report.txt".into()]), exact_selection: true, ..Default::default() };
+    let summary = extract(&archive, &out, &options).unwrap();
+    assert_eq!(fs::read(out.join("report.txt")).unwrap(), b"selected");
+    assert_eq!(summary.files, 1);
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+    assert!(!tmp.path().join("outside.txt").exists());
+}
+
+#[test]
 fn stripping_paths_applies_overwrite_policy_to_collisions() {
     let tmp = tempdir().unwrap();
     let archive = tmp.path().join("collision.zip");

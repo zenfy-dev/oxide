@@ -17,7 +17,8 @@ archive engine (`oxide-core`), which you can also embed in your own programs.
   are supported. Zstandard, XZ and 7z/LZMA2 compression can use all CPU cores.
 - **Encryption:** AES-256/AES-128 ZIP and AES-256 7z, including encrypted 7z headers. Passwords
   are zeroed from memory after use and never logged.
-- **No telemetry, no network access, no external programs.** It is pure Rust apart from the
+- **No telemetry or network access. Archive operations need no external programs.** Opening
+  a file uses your operating system’s default application. The archive engine is pure Rust apart from the
   zstd, xz, bzip2 and (optional) UnRAR C libraries, which are compiled in.
 
 ## Install
@@ -116,6 +117,10 @@ You can:
 - **Open** an archive (⌘/Ctrl+O, drag-and-drop, the recent list, or Finder's Open With) and
   browse it like a folder. Use breadcrumbs, back/up (Backspace), and double-click to enter folders.
 - **Move** through the list with the arrow keys; Enter opens the selected folder.
+- **Open files** by double-clicking or pressing Enter. Oxide extracts only the selected file
+  into a temporary folder, then opens it in its default app.
+- **Preview** a selected file with Space, ⌘/Ctrl+P, the Preview button, or the right-click menu.
+  Read UTF-8 text or view PNG, JPEG, GIF (first frame), WebP, BMP, ICO and TIFF images inside Oxide.
 - **Sort** by any column and **search** across the whole archive (⌘/Ctrl+F). Search is
   case-insensitive; separate words to match each anywhere in the path (for example `src .rs`).
 - **Select** with click, ⌘/Ctrl-click and Shift-click, or select all with ⌘/Ctrl+A. Right-click
@@ -126,6 +131,11 @@ You can:
   without folder structure and hidden files.
 - **Add** (⌘/Ctrl+Shift+A) files to ZIP/TAR archives, or drop files onto an open archive.
 - **Test** (⌘/Ctrl+T) integrity.
+
+Previews are read-only. Temporary copies are removed when the preview closes; copies opened
+in another app are kept until Oxide exits so that app can finish reading them. Edits made in
+another app do not update the archive. Large text previews show the first 1 MiB or 10,000 lines;
+files over 64 MiB and images over 16 megapixels or 8192 pixels per side should be opened externally.
 
 Work runs on a background thread. The window stays responsive and shows the current file, items
 and bytes processed, percentage, speed, elapsed time, and an ETA, with a Cancel button.

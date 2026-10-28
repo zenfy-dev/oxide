@@ -59,6 +59,8 @@ headers. Extraction selections use a hash set with ancestor lookups, so matching
 depends on path depth rather than the number of selected files. `strip_components` removes
 leading components only after path validation; selection matches original archive paths,
 hard-link targets are stripped too, and output collisions follow the overwrite policy.
+`exact_selection` instead matches raw stored names without descendant or `./` normalization,
+allowing one regular file to be prepared without extracting similarly named entries.
 
 Creation is the mirror image. `CreateJob::prepare` validates options, walks inputs in sorted
 order (excluding the output itself), and records sizes. Handlers then write entries, using
@@ -106,6 +108,13 @@ The browser caches archive totals and lowercase search paths when opening an arc
 Multiword searches match every term against the cached full path, and natural sorting
 compares numeric slices without allocating strings for each comparison.
 
+`file_access.rs` prepares an exact regular-file selection through the core extractor in a
+private temporary directory. Extraction, bounded text/image decoding, and the OS default-app
+handoff run on worker threads with the existing progress, cancellation and password retry
+flow. Links cannot be opened. `components/preview.rs` renders a read-only text or image window.
+Temporary directories use shared leases: closing a preview releases its copy, while files
+handed to another app remain alive until Oxide exits. Opening a file never updates the archive.
+
 ## Adding a format
 
 1. **Declare it.** Add a variant to `ArchiveFormat` in `formats.rs`, then fill in `name()`,
@@ -143,3 +152,4 @@ compares numeric slices without allocating strings for each comparison.
 | `walkdir`, `tempfile`, `zeroize`, `thiserror`, `tracing`, `serde`, `chrono` | Infrastructure |
 | `clap`, `indicatif`, `ctrlc` | CLI |
 | `eframe`/`egui`, `egui_extras`, `rfd` | GUI, table, native dialogs (XDG portal on Linux) |
+| `image`, `open` | Bounded local image previews and OS default-application handoff |

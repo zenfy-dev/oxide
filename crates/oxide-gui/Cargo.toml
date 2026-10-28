@@ -20,6 +20,8 @@ rar = ["oxide-core/rar"]
 oxide-core = { workspace = true, default-features = false }
 eframe = { version = "0.37.0", features = ["persistence"] }
 egui_extras = "0.37.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
+open = { version = "5.4.5", features = ["shellexecute-on-windows"] }
 rfd = "0.17.2"
 anyhow.workspace = true
 serde.workspace = true
@@ -34,3 +36,6 @@ objc2-foundation = { version = "0.3.2", features = ["NSAppleEventDescriptor", "N
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.34"
+
+[dev-dependencies]
+zip = { version = "9.1.3", default-features = false, features = ["deflate"] }

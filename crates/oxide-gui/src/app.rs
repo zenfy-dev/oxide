@@ -10,13 +10,15 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use oxide_core::{
-    ArchiveFormat, ArchiveInfo, CancelToken, CreateOptions, ExtractOptions, OperationSummary, OxideError, Password,
-    Progress, ProgressUpdate, ReadOptions,
+    ArchiveFormat, ArchiveInfo, CancelToken, CreateOptions, Entry, EntryKind, ExtractOptions, OperationSummary,
+    OxideError, Password, Progress, ProgressUpdate, ReadOptions,
 };
 
 use crate::components::create_dialog::CreateDialog;
 use crate::components::extract_dialog::ExtractDialog;
 use crate::components::file_table::{Row, SortKey, Tree};
+use crate::components::preview::Preview;
+use crate::file_access::{self, FileIntent, PreparedFile, StagedFile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -27,6 +29,7 @@ pub enum JobKind {
     Add,
     /// Extract beside the archive (files opened from Finder).
     QuickExtract,
+    File,
 }
 
 /// Whether the window is shown, decided at launch.
@@ -47,6 +50,8 @@ const LAUNCH_GRACE: Duration = Duration::from_millis(150);
 pub enum JobOutput {
     Listing(ArchiveInfo),
     Summary(OperationSummary, PathBuf),
+    PreviewFile(Box<PreparedFile>),
+    OpenedFile(StagedFile),
 }
 
 #[derive(Default)]
@@ -77,6 +82,7 @@ pub enum Action {
     Extract { archive: PathBuf, dest: PathBuf, options: ExtractOptions },
     Test(PathBuf),
     QuickExtract(PathBuf),
+    File { archive: PathBuf, entry: Entry, intent: FileIntent },
 }
 
 pub struct OpenArchive {
@@ -170,6 +176,13 @@ impl OpenArchive {
     pub fn supports_add(&self) -> bool {
         self.info.format == ArchiveFormat::Zip || self.info.format.is_tar()
     }
+
+    pub fn selected_file(&self) -> Option<&str> {
+        if self.selection.len() != 1 {
+            return None;
+        }
+        self.rows.iter().find(|row| self.selection.contains(&row.path))?.file_path.as_deref()
+    }
 }
 
 pub struct Toast {
@@ -198,6 +211,9 @@ pub struct OxideApp {
     pub job: Option<Job>,
     pub create: Option<CreateDialog>,
     pub extract: Option<ExtractDialog>,
+    pub preview: Option<Preview>,
+    /// External applications may read lazily; retain these copies until exit.
+    opened_files: Vec<StagedFile>,
     pub password_prompt: Option<PasswordPrompt>,
     /// Files dropped onto an open archive, awaiting "add or create" choice.
     pub drop_choice: Option<Vec<PathBuf>>,
@@ -234,6 +250,8 @@ impl OxideApp {
             job: None,
             create: None,
             extract: None,
+            preview: None,
+            opened_files: Vec::new(),
             password_prompt: None,
             drop_choice: None,
             error: None,
@@ -351,7 +369,50 @@ impl OxideApp {
                     oxide_core::extract(&archive, &dest, &options, progress).map(|s| JobOutput::Summary(s, dest))
                 });
             }
+            Action::File { archive, entry, intent } => {
+                let verb = if intent == FileIntent::Open { "Opening" } else { "Previewing" };
+                let title = format!("{verb} {}", entry.name());
+                self.spawn(ctx, JobKind::File, title, move |progress| {
+                    let prepared = file_access::prepare(&archive, &entry, password, intent, progress)?;
+                    match intent {
+                        FileIntent::Open => {
+                            progress.cancel_token().check()?;
+                            file_access::open_default(&prepared.file)?;
+                            Ok(JobOutput::OpenedFile(prepared.file))
+                        }
+                        FileIntent::Preview => Ok(JobOutput::PreviewFile(Box::new(prepared))),
+                    }
+                });
+            }
         }
+    }
+
+    pub fn open_entry(&mut self, ctx: &egui::Context, path: &str, intent: FileIntent) {
+        let Some(archive) = &self.archive else { return };
+        let Some(entry) = archive.info.entries.iter().find(|entry| entry.path == path && entry.kind == EntryKind::File)
+        else {
+            self.error = Some("Only regular files can be opened or previewed.".into());
+            return;
+        };
+        self.run(ctx, Action::File { archive: archive.info.path.clone(), entry: entry.clone(), intent });
+    }
+
+    pub fn preview_selected(&mut self, ctx: &egui::Context) {
+        if let Some(path) = self.archive.as_ref().and_then(OpenArchive::selected_file).map(str::to_owned) {
+            self.open_entry(ctx, &path, FileIntent::Preview);
+        }
+    }
+
+    pub fn open_staged(&mut self, ctx: &egui::Context, file: StagedFile) {
+        if self.busy() {
+            return;
+        }
+        let title = format!("Opening {}", file.name);
+        self.spawn(ctx, JobKind::File, title, move |progress| {
+            progress.cancel_token().check()?;
+            file_access::open_default(&file)?;
+            Ok(JobOutput::OpenedFile(file))
+        });
     }
 
     pub fn start_create(&mut self, ctx: &egui::Context, inputs: Vec<PathBuf>, output: PathBuf, options: CreateOptions) {
@@ -449,6 +510,7 @@ impl OxideApp {
                 tracing::info!(path = %info.path.display(), entries = info.entries.len(), "archive opened");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} — Oxide", file_name(&info.path))));
                 self.search.clear();
+                self.preview = None;
                 self.remember(info.path.clone());
                 self.archive = Some(OpenArchive::new(info));
             }
@@ -483,7 +545,14 @@ impl OxideApp {
                         self.notify(format!("Added {} items", summary.files + summary.directories));
                         self.run(ctx, Action::Open(target));
                     }
-                    JobKind::Open => {}
+                    JobKind::Open | JobKind::File => {}
+                }
+            }
+            JobOutput::PreviewFile(prepared) => self.preview = Some(Preview::new(*prepared)),
+            JobOutput::OpenedFile(file) => {
+                self.notify(format!("Opened {} · edits won’t update the archive", file.name));
+                if !self.opened_files.iter().any(|opened| opened.path == file.path) {
+                    self.opened_files.push(file);
                 }
             }
         }
@@ -574,6 +643,10 @@ pub fn file_name(path: &Path) -> String {
 
 impl eframe::App for OxideApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        #[cfg(debug_assertions)]
+        if self.capture.is_some() {
+            return;
+        }
         let theme = match self.theme {
             egui::ThemePreference::Light => "light",
             egui::ThemePreference::Dark => "dark",
@@ -594,7 +667,78 @@ impl eframe::App for OxideApp {
         crate::ui::draw(self, ui);
         #[cfg(debug_assertions)]
         if let Some(capture) = &mut self.capture {
-            capture.tick(ui.ctx());
+            let waiting_for_preview = std::env::var("OXIDE_DEMO").as_deref() == Ok("preview")
+                && self.preview.is_none()
+                && self.error.is_none();
+            if waiting_for_preview {
+                ui.ctx().request_repaint_after(Duration::from_millis(25));
+            } else {
+                capture.tick(ui.ctx());
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn archive(root: &Path, encrypted: bool) -> ArchiveInfo {
+        let input = root.join("notes.txt");
+        std::fs::write(&input, "archive preview ✓").unwrap();
+        let archive = root.join("notes.zip");
+        let options = CreateOptions { password: encrypted.then(|| "right".into()), ..Default::default() };
+        oxide_core::create(&[input], &archive, &options, &Progress::none()).unwrap();
+        oxide_core::list(&archive, &ReadOptions::default()).unwrap()
+    }
+
+    fn wait_job(app: &mut OxideApp, ctx: &egui::Context) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.busy() {
+            assert!(Instant::now() < deadline, "worker did not finish");
+            app.poll_job(ctx);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn preview_password_prompt_retries_the_selected_file_and_closing_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = archive(tmp.path(), true);
+        let ctx = egui::Context::default();
+        let mut app = OxideApp::new(&ctx, None, None);
+        app.archive = Some(OpenArchive::new(info));
+        app.open_entry(&ctx, "notes.txt", FileIntent::Preview);
+        wait_job(&mut app, &ctx);
+        assert!(app.password_prompt.as_ref().is_some_and(|p| !p.wrong));
+        app.password_prompt = None;
+        app.retry_with_password(&ctx, "wrong".into());
+        wait_job(&mut app, &ctx);
+        assert!(app.password_prompt.as_ref().is_some_and(|p| p.wrong));
+        app.password_prompt = None;
+        app.retry_with_password(&ctx, "right".into());
+        wait_job(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let path = app.preview.as_ref().unwrap().file.path.clone();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "archive preview ✓");
+        app.preview = None;
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn opened_copies_survive_archive_changes_and_are_removed_when_the_app_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = archive(tmp.path(), false);
+        let prepared =
+            file_access::prepare(&info.path, &info.entries[0], None, FileIntent::Open, &Progress::none()).unwrap();
+        let path = prepared.file.path.clone();
+        let ctx = egui::Context::default();
+        let mut app = OxideApp::new(&ctx, None, None);
+        app.archive = Some(OpenArchive::new(info));
+        app.job_succeeded(&ctx, JobKind::File, JobOutput::OpenedFile(prepared.file));
+        app.archive = None;
+        assert!(path.is_file());
+        drop(app);
+        assert!(!path.exists());
     }
 }

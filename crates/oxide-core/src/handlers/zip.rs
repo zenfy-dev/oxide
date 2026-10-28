@@ -460,7 +460,9 @@ mod tests {
     fn indexing_never_reads_or_seeks_entry_data() {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         writer.add_directory("folder/", SimpleFileOptions::default()).unwrap();
-        writer.start_file("folder/naïve.txt", SimpleFileOptions::default().unix_permissions(0o640)).unwrap();
+        // Mark the entry as Unix-made: on Windows zip defaults to DOS, whose entries carry no Unix mode.
+        let options = SimpleFileOptions::default().system(zip::System::Unix).unix_permissions(0o640);
+        writer.start_file("folder/naïve.txt", options).unwrap();
         writer.write_all(b"payload").unwrap();
         writer.add_symlink("link", "folder/naïve.txt", SimpleFileOptions::default()).unwrap();
         let bytes = writer.finish().unwrap().into_inner();
