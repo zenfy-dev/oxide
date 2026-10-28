@@ -195,6 +195,10 @@ struct ExtractArgs {
     #[arg(long = "only", value_name = "PATH")]
     only: Vec<String>,
 
+    /// Remove N leading folders from extracted paths (selection uses original paths).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    strip_components: usize,
+
     /// Do not create symbolic links.
     #[arg(long)]
     no_symlinks: bool,
@@ -447,6 +451,7 @@ fn run(cli: Cli, cancel: &CancelToken) -> anyhow::Result<()> {
                 symlinks: if args.no_symlinks { SymlinkPolicy::Skip } else { SymlinkPolicy::Contained },
                 limits,
                 selection: (!args.only.is_empty()).then_some(args.only),
+                strip_components: args.strip_components,
                 password: args.read.password.get()?,
                 format: args.read.format,
                 preserve_permissions: !args.no_preserve,

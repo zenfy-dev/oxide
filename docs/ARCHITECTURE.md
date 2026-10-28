@@ -54,11 +54,22 @@ matters for safety lives in the visitors, so every format gets identical treatme
   real bytes against limits, writes to a temp file and renames it into place.
 - `finish()` creates deferred symlinks, then re-verifies them by resolving the real paths.
 
+ZIP indexing uses the in-memory central directory, without seeking to individual local
+headers. Extraction selections use a hash set with ancestor lookups, so matching cost
+depends on path depth rather than the number of selected files. `strip_components` removes
+leading components only after path validation; selection matches original archive paths,
+hard-link targets are stripped too, and output collisions follow the overwrite policy.
+
 Creation is the mirror image. `CreateJob::prepare` validates options, walks inputs in sorted
 order (excluding the output itself), and records sizes. Handlers then write entries, using
 `job.open(item)`, a reader that reports progress, honours cancellation, and errors if a file
 changes size mid-read. `create()` writes into a `NamedTempFile` in the destination directory
 and persists it only on success (`persist_noclobber` unless overwriting).
+
+Parallel ZIP compression keeps at most two pending files per worker and 64 MiB of input
+bytes across queued, compressing and completed files together. Results count against both
+limits until written, preventing a slow early file from retaining unbounded later results.
+Compression workers reuse their read buffers.
 
 ### Progress and cancellation
 
@@ -90,6 +101,10 @@ The GUI is split into `app.rs` (state, actions, jobs), `ui.rs` (layout, toolbar,
 shortcuts, drag-and-drop), `theme.rs` (visuals and the embedded app icon) and
 `components/` (file table and folder tree, create/extract dialogs, progress modal).
 `devtools.rs` exists only in debug builds and lets the app screenshot itself for documentation.
+
+The browser caches archive totals and lowercase search paths when opening an archive.
+Multiword searches match every term against the cached full path, and natural sorting
+compares numeric slices without allocating strings for each comparison.
 
 ## Adding a format
 

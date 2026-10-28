@@ -128,3 +128,19 @@ fn quiet_mode_prints_nothing() {
     tree(tmp.path());
     oxide().current_dir(tmp.path()).args(["-q", "create", "docs", "-o", "a.zip"]).assert().success().stdout("");
 }
+
+#[test]
+fn extracts_without_wrapper_folders() {
+    let tmp = tempdir().unwrap();
+    tree(tmp.path());
+    oxide().current_dir(tmp.path()).args(["create", "docs", "-o", "wrapped.zip"]).assert().success();
+    oxide()
+        .current_dir(tmp.path())
+        .args(["extract", "wrapped.zip", "-o", "out", "--strip-components", "1", "--only", "./docs/nested"])
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(tmp.path().join("out/nested/b.txt")).unwrap(), "beta ✓");
+    assert!(!tmp.path().join("out/docs").exists());
+    assert!(!tmp.path().join("out/a.txt").exists());
+    oxide().args(["extract", "missing.zip", "--strip-components", "-1"]).assert().code(2);
+}

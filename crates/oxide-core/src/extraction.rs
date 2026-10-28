@@ -15,6 +15,7 @@
 //!   failure never leaves a half-written file under the final name;
 //! * existing files are never replaced unless [`OverwritePolicy`] allows it.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -114,6 +115,10 @@ pub struct ExtractOptions {
     /// Only extract these archive paths (and, for directories, everything
     /// beneath them). `None` extracts everything.
     pub selection: Option<Vec<String>>,
+    /// Remove this many leading path components after validating each path.
+    /// Entries with no remaining components are skipped. Selection uses the
+    /// original archive paths, before stripping.
+    pub strip_components: usize,
     /// Password for encrypted archives.
     pub password: Option<Password>,
     /// Skip detection and treat the file as this format.
@@ -131,6 +136,7 @@ impl Default for ExtractOptions {
             symlinks: SymlinkPolicy::Contained,
             limits: ExtractLimits::default(),
             selection: None,
+            strip_components: 0,
             password: None,
             format: None,
             preserve_permissions: true,
@@ -276,13 +282,23 @@ struct PendingLink {
     raw: String,
 }
 
+/// Match conventional `./` prefixes and redundant separators without resolving
+/// `..`; selected paths still pass through the extraction safety checks.
+fn selection_path(raw: &str) -> Cow<'_, str> {
+    let trimmed = raw.trim_matches('/');
+    if !trimmed.contains('\\') && !trimmed.split('/').any(|p| p.is_empty() || p == ".") {
+        return Cow::Borrowed(trimmed);
+    }
+    Cow::Owned(raw.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect::<Vec<_>>().join("/"))
+}
+
 /// The visitor that writes entries to disk under the destination root.
 pub(crate) struct ExtractVisitor<'a> {
     root: PathBuf,
     options: &'a ExtractOptions,
     tracker: &'a Tracker<'a>,
     archive_len: u64,
-    selection: Option<Vec<String>>,
+    selection: Option<HashSet<String>>,
     entries_seen: u64,
     total_written: u64,
     written: HashSet<PathBuf>,
@@ -305,10 +321,8 @@ pub(crate) struct ExtractVisitor<'a> {
 
 impl<'a> ExtractVisitor<'a> {
     pub(crate) fn new(root: PathBuf, options: &'a ExtractOptions, tracker: &'a Tracker<'a>, archive_len: u64) -> Self {
-        let selection = options
-            .selection
-            .as_ref()
-            .map(|sel| sel.iter().map(|s| s.replace('\\', "/").trim_matches('/').to_owned()).collect());
+        let selection =
+            options.selection.as_ref().map(|sel| sel.iter().map(|s| selection_path(s).into_owned()).collect());
         ExtractVisitor {
             root,
             options,
@@ -333,12 +347,31 @@ impl<'a> ExtractVisitor<'a> {
         let Some(sel) = &self.selection else {
             return true;
         };
-        let path = entry.path.trim_matches('/');
-        sel.iter().any(|s| {
-            s.is_empty()
-                || path == s
-                || (path.len() > s.len() && path.starts_with(s.as_str()) && path.as_bytes()[s.len()] == b'/')
-        })
+        if sel.contains("") {
+            return true;
+        }
+        let path = selection_path(&entry.path);
+        let mut ancestor = path.as_ref();
+        loop {
+            if sel.contains(ancestor) {
+                return true;
+            }
+            match ancestor.rsplit_once('/') {
+                Some((parent, _)) => ancestor = parent,
+                None => return false,
+            }
+        }
+    }
+
+    fn output_path(&self, raw: &str) -> Result<Option<PathBuf>> {
+        let Some(path) = sanitize_entry_path(raw)? else {
+            return Ok(None);
+        };
+        if self.options.strip_components == 0 {
+            return Ok(Some(path));
+        }
+        let stripped: PathBuf = path.components().skip(self.options.strip_components).collect();
+        Ok((!stripped.as_os_str().is_empty()).then_some(stripped))
     }
 
     fn check_declared_size(&self, entry: &Entry) -> Result<()> {
@@ -466,7 +499,9 @@ impl<'a> ExtractVisitor<'a> {
         };
         // An archive may legitimately contain the same path twice (e.g. an
         // appended tar); the later copy wins over what we wrote ourselves.
-        if !exists || self.written.contains(rel) {
+        // Stripping can collapse distinct archive paths onto one output, so
+        // always apply the overwrite policy when components are removed.
+        if !exists || (self.options.strip_components == 0 && self.written.contains(rel)) {
             return Ok(Some((target, exists)));
         }
         match self.options.overwrite {
@@ -616,6 +651,15 @@ impl<'a> ExtractVisitor<'a> {
         let Some(target_rel) = sanitize_entry_path(raw_target)? else {
             return Err(OxideError::UnsafePath { path: entry.path.clone(), reason: "hard link has an empty target" });
         };
+        let target_rel: PathBuf = target_rel.components().skip(self.options.strip_components).collect();
+        if target_rel.as_os_str().is_empty() {
+            self.summary.warnings.push(format!(
+                "skipped hard link {} (target {raw_target} has no path after stripping components)",
+                entry.path
+            ));
+            self.summary.skipped += 1;
+            return Ok(());
+        }
         let source = self.root.join(&target_rel);
         // The source must be a regular file we can reach without symlinks.
         self.check_no_symlinks(&target_rel)?;
@@ -712,7 +756,11 @@ impl EntryVisitor for ExtractVisitor<'_> {
     fn begin(&mut self, index: Option<&[Entry]>) {
         if let Some(index) = index {
             let selected: Vec<_> = index.iter().filter(|e| self.selected(e)).collect();
-            let bytes = selected.iter().filter_map(|e| e.size).sum();
+            let bytes = selected
+                .iter()
+                .filter(|e| self.options.strip_components == 0 || self.output_path(&e.path).is_ok_and(|p| p.is_some()))
+                .filter_map(|e| e.size)
+                .sum();
             self.tracker.set_totals(Some(selected.len() as u64), Some(bytes));
         }
     }
@@ -727,13 +775,19 @@ impl EntryVisitor for ExtractVisitor<'_> {
         {
             return Err(OxideError::LimitExceeded(format!("archive has more than {max} entries")));
         }
+        if self.options.strip_components > 0 && self.output_path(&entry.path)?.is_none() {
+            self.summary.skipped += 1;
+            self.tracker.start_entry(&entry.path);
+            self.tracker.finish_entry();
+            return Ok(false);
+        }
         self.check_declared_size(entry)?;
         Ok(true)
     }
 
     fn visit(&mut self, entry: &Entry, data: Option<&mut dyn Read>) -> Result<()> {
         self.tracker.check_cancel()?;
-        let Some(rel) = sanitize_entry_path(&entry.path)? else {
+        let Some(rel) = self.output_path(&entry.path)? else {
             return Ok(());
         };
         // Matches what `sanitize_entry_path` strips: a leading separator or a
@@ -781,6 +835,8 @@ impl EntryVisitor for ExtractVisitor<'_> {
 
 #[derive(Clone, Copy)]
 struct FileMeta {
+    /// Unix permission bits; Windows has no equivalent, so they are not applied there.
+    #[cfg_attr(not(unix), allow(dead_code))]
     mode: Option<u32>,
     mtime: Option<SystemTime>,
 }

@@ -60,6 +60,78 @@ fn zip_slip_is_rejected() {
 }
 
 #[test]
+fn stripping_components_cannot_hide_traversal() {
+    for name in ["../outside.txt", "wrapper/../outside.txt", "wrapper/dir/../../outside.txt"] {
+        let tmp = tempdir().unwrap();
+        let archive = tmp.path().join("evil.zip");
+        write_zip(&archive, &[(name, b"pwned")]);
+        for strip_components in [1, 2, usize::MAX] {
+            let opts = ExtractOptions { strip_components, ..Default::default() };
+            let err = extract(&archive, &tmp.path().join("out"), &opts).unwrap_err();
+            assert!(matches!(err, OxideError::UnsafePath { .. }), "{name}: {err:?}");
+        }
+        assert!(!tmp.path().join("outside.txt").exists());
+    }
+}
+
+#[test]
+fn stripping_paths_applies_overwrite_policy_to_collisions() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("collision.zip");
+    write_zip(&archive, &[("first/file.txt", b"one"), ("second/file.txt", b"two")]);
+    let out = tmp.path().join("out");
+    let opts = ExtractOptions { strip_components: 1, overwrite: OverwritePolicy::Rename, ..Default::default() };
+    let summary = extract(&archive, &out, &opts).unwrap();
+    assert_eq!(summary.files, 2);
+    assert_eq!(fs::read(out.join("file.txt")).unwrap(), b"one");
+    assert_eq!(fs::read(out.join("file (1).txt")).unwrap(), b"two");
+    assert!(!has_temp_files(tmp.path()));
+}
+
+#[test]
+fn hardlink_targets_follow_stripped_paths() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("links.tar");
+    write_raw_tar(
+        &archive,
+        &[
+            ("wrapper/data.txt", EntryType::Regular, "", b"payload", 0o644),
+            ("wrapper/copy.txt", EntryType::Link, "wrapper/data.txt", b"", 0o644),
+            ("wrapper/missing.txt", EntryType::Link, "wrapper", b"", 0o644),
+        ],
+    );
+    let out = tmp.path().join("out");
+    let opts = ExtractOptions { strip_components: 1, ..Default::default() };
+    let summary = extract(&archive, &out, &opts).unwrap();
+    assert_eq!(fs::read(out.join("copy.txt")).unwrap(), b"payload");
+    assert_eq!(summary.links, 1);
+    assert_eq!(summary.skipped, 1);
+    assert!(!out.join("wrapper").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_remain_confined_after_stripping() {
+    let tmp = tempdir().unwrap();
+    let archive = tmp.path().join("links.tar");
+    write_raw_tar(
+        &archive,
+        &[
+            ("wrapper/data.txt", EntryType::Regular, "", b"payload", 0o644),
+            ("wrapper/link.txt", EntryType::Symlink, "data.txt", b"", 0o777),
+            ("wrapper/escape", EntryType::Symlink, "../outside", b"", 0o777),
+        ],
+    );
+    let out = tmp.path().join("out");
+    let opts = ExtractOptions { strip_components: 1, ..Default::default() };
+    let summary = extract(&archive, &out, &opts).unwrap();
+    assert_eq!(fs::read(out.join("link.txt")).unwrap(), b"payload");
+    assert!(fs::symlink_metadata(out.join("escape")).is_err());
+    assert_eq!(summary.links, 1);
+    assert_eq!(summary.skipped, 1);
+}
+
+#[test]
 fn tar_traversal_is_rejected() {
     let tmp = tempdir().unwrap();
     let archive = tmp.path().join("evil.tar");

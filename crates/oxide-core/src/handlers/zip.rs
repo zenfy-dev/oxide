@@ -4,10 +4,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
-use ::zip::read::ZipFile;
+use ::zip::read::{ZipFile, ZipFileEntry};
 use ::zip::result::ZipError;
 use ::zip::write::{PreparedZipFile, SimpleFileOptions, ZipFileBuilder};
 use ::zip::{AesMode, CompressionMethod as ZipMethod, ZipArchive, ZipWriter};
@@ -41,7 +42,7 @@ fn open(ctx: &ReadContext) -> Result<ZipArchive<BufReader<File>>> {
     ZipArchive::new(BufReader::with_capacity(256 * 1024, file)).map_err(map_err)
 }
 
-fn entry_of<R: Read + ?Sized>(f: &ZipFile<'_, R>) -> Entry {
+fn entry_of(f: &ZipFileEntry<'_>) -> Entry {
     let path = match f.name() {
         Ok(name) => name.into_owned(),
         Err(_) => String::from_utf8_lossy(f.name_raw()).into_owned(),
@@ -63,8 +64,15 @@ fn entry_of<R: Read + ?Sized>(f: &ZipFile<'_, R>) -> Entry {
 }
 
 /// Reads every entry's metadata from the central directory.
-fn index(zip: &mut ZipArchive<BufReader<File>>) -> Result<Vec<Entry>> {
-    (0..zip.len()).map(|i| zip.by_index_raw(i).map(|f| entry_of(&f)).map_err(map_err)).collect()
+fn index<R: Read + Seek>(zip: &ZipArchive<R>, ctx: &ReadContext) -> Result<Vec<Entry>> {
+    (0..zip.len())
+        .map(|i| {
+            ctx.tracker.check_cancel()?;
+            // Central-directory metadata is already in memory. Opening each raw
+            // file would seek to its local header just to read the same fields.
+            zip.by_index_data(i).map(|f| entry_of(&f)).map_err(map_err)
+        })
+        .collect()
 }
 
 fn open_entry<'z>(
@@ -83,12 +91,12 @@ fn open_entry<'z>(
 
 impl FormatHandler for ZipHandler {
     fn list(&self, ctx: &ReadContext) -> Result<Vec<crate::archive::Entry>> {
-        index(&mut open(ctx)?)
+        index(&open(ctx)?, ctx)
     }
 
     fn read(&self, ctx: &ReadContext, visitor: &mut dyn EntryVisitor) -> Result<()> {
         let mut zip = open(ctx)?;
-        let index = index(&mut zip)?;
+        let index = index(&zip, ctx)?;
         visitor.begin(Some(&index));
         for (i, entry) in index.iter().enumerate() {
             ctx.tracker.check_cancel()?;
@@ -172,6 +180,8 @@ fn add_inputs<W: Write + Seek>(zip: &mut ZipWriter<W>, job: &CreateJob) -> Resul
 
 /// Files compressed by worker threads in parallel ZIP creation.
 const PARALLEL_FILE_MAX: u64 = 8 * 1024 * 1024;
+/// Input bytes represented by queued, compressing and completed files together.
+const PARALLEL_BUFFER_MAX: u64 = 64 * 1024 * 1024;
 
 fn is_pooled(item: &InputItem) -> bool {
     matches!(item.kind, InputKind::File { size } if size > 0 && size <= PARALLEL_FILE_MAX)
@@ -237,14 +247,22 @@ struct CompressJob {
 }
 
 /// Compresses one file into memory on a worker thread.
-fn compress_one(job: CompressJob, progress: &WorkerProgress, cancel: &CancelToken) -> Result<PreparedZipFile> {
+fn compress_one(
+    job: CompressJob,
+    progress: &WorkerProgress,
+    cancel: &CancelToken,
+    abort: &AtomicBool,
+    buf: &mut [u8],
+) -> Result<PreparedZipFile> {
     progress.set_current(&job.name);
     let mut builder = ZipFileBuilder::new(&job.name, job.options).map_err(map_err)?;
     let mut file = File::open(&job.path).at(&job.path)?;
-    let mut buf = vec![0u8; 64 * 1024];
     let mut remaining = job.size;
     while remaining > 0 {
         cancel.check()?;
+        if abort.load(Ordering::Relaxed) {
+            return Err(OxideError::Cancelled);
+        }
         let max = buf.len().min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let n = file.read(&mut buf[..max]).at(&job.path)?;
         if n == 0 {
@@ -271,22 +289,29 @@ fn add_inputs_parallel<W: Write + Seek>(
     method: ZipMethod,
     level: Option<i64>,
 ) -> Result<()> {
-    let workers = job.threads as usize;
+    let workers = (job.threads as usize).min(job.inputs.iter().filter(|i| is_pooled(i)).count());
     let progress = WorkerProgress::default();
     let cancel = job.tracker.cancel().clone();
-    let (job_tx, job_rx) = mpsc::sync_channel::<CompressJob>(workers * 2);
+    let abort = AtomicBool::new(false);
+    // The dispatcher bounds all pending files, including completed results.
+    // Sending must never block progress forwarding or cancellation checks.
+    let (job_tx, job_rx) = mpsc::channel::<CompressJob>();
     let job_rx = Mutex::new(job_rx);
     let (result_tx, results) = mpsc::channel::<(usize, Result<PreparedZipFile>)>();
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            let (job_rx, result_tx, progress, cancel) = (&job_rx, result_tx.clone(), &progress, &cancel);
+            let (job_rx, result_tx, progress, cancel, abort) = (&job_rx, result_tx.clone(), &progress, &cancel, &abort);
             scope.spawn(move || {
+                let mut buf = vec![0u8; 64 * 1024];
                 loop {
                     let next = job_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                     let Ok(job) = next else { return };
+                    if abort.load(Ordering::Relaxed) || cancel.is_cancelled() {
+                        return;
+                    }
                     let index = job.index;
-                    if result_tx.send((index, compress_one(job, progress, cancel))).is_err() {
+                    if result_tx.send((index, compress_one(job, progress, cancel, abort, &mut buf))).is_err() {
                         return;
                     }
                 }
@@ -295,7 +320,9 @@ fn add_inputs_parallel<W: Write + Seek>(
         drop(result_tx);
         let mut job_tx = Some(job_tx);
         let result = write_in_order(zip, job, method, level, &mut job_tx, &results, &progress, workers);
-        // Closing the queue lets workers exit after at most one more (small) file.
+        if result.is_err() {
+            abort.store(true, Ordering::Relaxed);
+        }
         drop(job_tx);
         result
     })
@@ -307,7 +334,7 @@ fn write_in_order<W: Write + Seek>(
     job: &CreateJob,
     method: ZipMethod,
     level: Option<i64>,
-    job_tx: &mut Option<mpsc::SyncSender<CompressJob>>,
+    job_tx: &mut Option<mpsc::Sender<CompressJob>>,
     results: &mpsc::Receiver<(usize, Result<PreparedZipFile>)>,
     progress: &WorkerProgress,
     workers: usize,
@@ -316,60 +343,58 @@ fn write_in_order<W: Write + Seek>(
     let mut ready: HashMap<usize, Result<PreparedZipFile>> = HashMap::new();
     let mut seen = Forwarded::default();
     let mut next = 0; // next entry to write
-    let mut outstanding = 0usize;
+    let mut submitted = 0;
+    let mut pending_files = 0;
+    let mut pending_bytes = 0;
 
-    // Writes every entry up to `limit` whose turn has come and whose data is ready.
-    let emit = |zip: &mut ZipWriter<W>,
-                ready: &mut HashMap<usize, Result<PreparedZipFile>>,
-                next: &mut usize,
-                limit: usize| {
-        while *next < limit {
-            let item = &inputs[*next];
+    while next < inputs.len() {
+        // Count files until they are written, not merely until a worker sends
+        // its result. Otherwise a slow first file can retain an entire archive.
+        while let Some(item) = inputs.get(submitted) {
+            job.tracker.check_cancel()?;
             if is_pooled(item) {
-                let Some(prepared) = ready.remove(next) else { break };
-                job.tracker.start_entry(&item.name);
-                zip.add_prepared_file(prepared?).map_err(map_err)?;
-            } else {
-                add_one(zip, job, item, method, level)?;
+                if pending_files >= workers * 2 || pending_bytes + item.size() > PARALLEL_BUFFER_MAX {
+                    break;
+                }
+                let task = CompressJob {
+                    index: submitted,
+                    name: item.name.clone(),
+                    path: item.source.clone(),
+                    size: item.size(),
+                    options: file_options(item, method, level),
+                };
+                if !job_tx.as_ref().is_some_and(|tx| tx.send(task).is_ok()) {
+                    return Err(OxideError::from(std::io::Error::other("ZIP compression threads stopped")));
+                }
+                pending_files += 1;
+                pending_bytes += item.size();
             }
-            *next += 1;
+            submitted += 1;
         }
-        Ok::<_, OxideError>(())
-    };
-
-    for (index, item) in inputs.iter().enumerate() {
-        job.tracker.check_cancel()?;
-        if is_pooled(item) {
-            let task = CompressJob {
-                index,
-                name: item.name.clone(),
-                path: item.source.clone(),
-                size: item.size(),
-                options: file_options(item, method, level),
-            };
-            let sent = job_tx.as_ref().is_some_and(|tx| tx.send(task).is_ok());
-            if !sent {
-                return Err(OxideError::from(std::io::Error::other("ZIP compression threads stopped")));
-            }
-            outstanding += 1;
+        if submitted == inputs.len() {
+            *job_tx = None;
         }
         while let Ok((i, r)) = results.try_recv() {
             ready.insert(i, r);
-            outstanding -= 1;
-        }
-        // Keep a bounded number of compressed files waiting in memory.
-        while outstanding > workers * 4 {
-            receive(results, &mut ready, &mut outstanding, job, progress, &mut seen)?;
-            emit(zip, &mut ready, &mut next, index + 1)?;
         }
         progress.forward(job.tracker, &mut seen);
-        emit(zip, &mut ready, &mut next, index + 1)?;
-    }
-    *job_tx = None;
-    while next < inputs.len() {
-        emit(zip, &mut ready, &mut next, inputs.len())?;
-        if next < inputs.len() {
-            receive(results, &mut ready, &mut outstanding, job, progress, &mut seen)?;
+
+        while next < submitted {
+            job.tracker.check_cancel()?;
+            let item = &inputs[next];
+            if is_pooled(item) {
+                let Some(prepared) = ready.remove(&next) else { break };
+                job.tracker.start_entry(&item.name);
+                zip.add_prepared_file(prepared?).map_err(map_err)?;
+                pending_files -= 1;
+                pending_bytes -= item.size();
+            } else {
+                add_one(zip, job, item, method, level)?;
+            }
+            next += 1;
+        }
+        if next < submitted {
+            receive(results, &mut ready, job, progress, &mut seen)?;
         }
     }
     progress.forward(job.tracker, &mut seen);
@@ -380,7 +405,6 @@ fn write_in_order<W: Write + Seek>(
 fn receive(
     results: &mpsc::Receiver<(usize, Result<PreparedZipFile>)>,
     ready: &mut HashMap<usize, Result<PreparedZipFile>>,
-    outstanding: &mut usize,
     job: &CreateJob,
     progress: &WorkerProgress,
     seen: &mut Forwarded,
@@ -391,13 +415,128 @@ fn receive(
         match results.recv_timeout(Duration::from_millis(50)) {
             Ok((i, r)) => {
                 ready.insert(i, r);
-                *outstanding -= 1;
                 return Ok(());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(OxideError::from(std::io::Error::other("ZIP compression threads stopped")));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::io::{self, Cursor, SeekFrom};
+    use std::path::Path;
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::compression::CreateOptions;
+    use crate::formats::ArchiveFormat;
+    use crate::progress::{Operation, Progress, Tracker};
+
+    struct CountIo {
+        inner: Cursor<Vec<u8>>,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl Read for CountIo {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.calls.set(self.calls.get() + 1);
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for CountIo {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.calls.set(self.calls.get() + 1);
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn indexing_never_reads_or_seeks_entry_data() {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer.add_directory("folder/", SimpleFileOptions::default()).unwrap();
+        writer.start_file("folder/naïve.txt", SimpleFileOptions::default().unix_permissions(0o640)).unwrap();
+        writer.write_all(b"payload").unwrap();
+        writer.add_symlink("link", "folder/naïve.txt", SimpleFileOptions::default()).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let calls = Rc::new(Cell::new(0));
+        let zip = ZipArchive::new(CountIo { inner: Cursor::new(bytes), calls: calls.clone() }).unwrap();
+        let before = calls.get();
+        let progress = Progress::none();
+        let tracker = Tracker::new(&progress, Operation::List);
+        let ctx =
+            ReadContext { path: Path::new("test.zip"), format: ArchiveFormat::Zip, password: None, tracker: &tracker };
+        let entries = index(&zip, &ctx).unwrap();
+        assert_eq!(calls.get(), before, "indexing touched local headers or file data");
+        assert_eq!(entries[0].kind, EntryKind::Directory);
+        assert_eq!(entries[1].path, "folder/naïve.txt");
+        assert_eq!(entries[1].size, Some(7));
+        assert_eq!(entries[1].mode, Some(0o640));
+        assert_eq!(entries[2].kind, EntryKind::Symlink);
+        progress.cancel_token().cancel();
+        assert!(matches!(index(&zip, &ctx), Err(OxideError::Cancelled)));
+    }
+
+    #[test]
+    fn slow_first_file_cannot_accumulate_unbounded_completed_files() {
+        for workers in [4, 16] {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = tmp.path().join("src");
+            std::fs::create_dir(&src).unwrap();
+            for i in 0..24 {
+                File::create(src.join(format!("f{i:02}"))).unwrap().set_len(PARALLEL_FILE_MAX).unwrap();
+            }
+            let progress = Progress::none();
+            let tracker = Tracker::new(&progress, Operation::Create);
+            let options = CreateOptions::default();
+            let job = CreateJob::prepare(ArchiveFormat::Zip, &[src], None, &options, &tracker).unwrap();
+            let shared = WorkerProgress::default();
+            let abort = AtomicBool::new(false);
+            let (task_tx, tasks) = mpsc::channel::<CompressJob>();
+            let (result_tx, results) = mpsc::channel();
+            let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+            std::thread::scope(|scope| {
+                let (shared, abort, cancel) = (&shared, &abort, progress.cancel_token());
+                scope.spawn(move || {
+                    let mut buf = vec![0; 64 * 1024];
+                    let send = |task: CompressJob, buf: &mut [u8]| {
+                        let index = task.index;
+                        let result = compress_one(task, shared, cancel, abort, buf);
+                        result_tx.send((index, result)).unwrap();
+                    };
+                    // Hold the first file while every later file finishes.
+                    let first = tasks.recv().unwrap();
+                    for _ in 1..8 {
+                        send(tasks.recv().unwrap(), &mut buf);
+                    }
+                    assert!(
+                        matches!(tasks.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)),
+                        "queued more than the file/byte budget while completed files were waiting"
+                    );
+                    send(first, &mut buf);
+                    while let Ok(task) = tasks.recv() {
+                        send(task, &mut buf);
+                    }
+                });
+                write_in_order(
+                    &mut zip,
+                    &job,
+                    ZipMethod::Deflated,
+                    Some(1),
+                    &mut Some(task_tx),
+                    &results,
+                    shared,
+                    workers,
+                )
+                .unwrap();
+            });
+            let archive = ZipArchive::new(zip.finish().unwrap()).unwrap();
+            assert_eq!(archive.len(), job.inputs.len());
         }
     }
 }

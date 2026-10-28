@@ -34,6 +34,12 @@ pub fn from_env(ctx: &egui::Context) -> Option<Capture> {
 }
 
 pub fn apply_demo(app: &mut OxideApp, ctx: &egui::Context) {
+    // Keep the toolbar's theme icon in step with a forced theme.
+    match std::env::var("OXIDE_THEME").as_deref() {
+        Ok("light") if app.theme != egui::ThemePreference::Light => app.set_theme(ctx, egui::ThemePreference::Light),
+        Ok("dark") if app.theme != egui::ThemePreference::Dark => app.set_theme(ctx, egui::ThemePreference::Dark),
+        _ => {}
+    }
     if let Ok(list) = std::env::var("OXIDE_RECENT")
         && !RECENT_SEEDED.swap(true, Ordering::Relaxed)
     {

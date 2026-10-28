@@ -262,7 +262,8 @@ fn search_contents(ui: &mut egui::Ui, text: &mut String, focus: &mut bool) {
                 .align(egui::Align2::LEFT_CENTER)
                 .min_size(egui::vec2(0.0, 24.0))
                 .desired_width(176.0);
-            let response = ui.add(edit);
+            let response =
+                ui.add(edit).on_hover_text("Search full paths; separate words to match each anywhere in the path.");
             if *focus {
                 response.request_focus();
                 *focus = false;
@@ -394,16 +395,19 @@ fn status_bar(app: &OxideApp, ui: &mut egui::Ui) {
         let mut text = format!(
             "{} archive  ·  {} files, {} folders  ·  {} uncompressed, {} on disk",
             info.format,
-            info.file_count(),
+            a.stats.files,
             folders,
-            human_bytes(info.total_size()),
+            human_bytes(a.stats.total_size),
             human_bytes(info.archive_size)
         );
-        if let Some(ratio) = info.compression_ratio().filter(|r| *r < 1.0) {
-            text.push_str(&format!(" (saves {:.0}%)", (1.0 - ratio) * 100.0));
+        // Below 1% the saving is noise; near 100% "saves 100%" would be untrue.
+        match a.stats.compression_ratio.map(|r| (1.0 - r) * 100.0) {
+            Some(saved) if saved >= 99.5 => text.push_str(" (saves over 99%)"),
+            Some(saved) if saved >= 1.0 => text.push_str(&format!(" (saves {saved:.0}%)")),
+            _ => {}
         }
         ui.label(RichText::new(text).small().color(weak));
-        if info.is_encrypted() {
+        if a.stats.encrypted {
             ui.add_space(4.0);
             icons::show(ui, Icon::Lock, weak);
             ui.label(RichText::new("Encrypted").small().color(weak));

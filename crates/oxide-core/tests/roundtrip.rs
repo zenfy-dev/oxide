@@ -350,6 +350,33 @@ fn selective_extraction() {
 }
 
 #[test]
+fn strip_wrapper_folders_and_select_using_original_paths() {
+    let tmp = tempdir().unwrap();
+    let src = make_tree(tmp.path());
+    for &format in MULTI_FILE {
+        let archive = tmp.path().join(format!("wrapped.{}", format.extension()));
+        oxide_core::create(std::slice::from_ref(&src), &archive, &CreateOptions::default(), &Progress::none()).unwrap();
+        let out = tmp.path().join(format!("stripped-{}", format.extension()));
+        let opts = ExtractOptions { strip_components: 1, ..Default::default() };
+        let summary = oxide_core::extract(&archive, &out, &opts, &Progress::none()).unwrap();
+        assert_eq!(snapshot(&out), snapshot(&src), "{format}");
+        assert_eq!(summary.skipped, 1, "the wrapper directory is skipped: {format}");
+
+        let selected = tmp.path().join(format!("selected-{}", format.extension()));
+        let opts = ExtractOptions {
+            selection: Some(vec!["./project//src/".into(), "project\\README.md".into()]),
+            strip_components: 2,
+            ..Default::default()
+        };
+        oxide_core::extract(&archive, &selected, &opts, &Progress::none()).unwrap();
+        assert!(selected.join("main.rs").is_file(), "{format}");
+        assert!(selected.join("deep/er/est/leaf.txt").is_file(), "{format}");
+        assert!(!selected.join("README.md").exists(), "short paths must be skipped: {format}");
+        assert!(!selected.join("noise.bin").exists(), "{format}");
+    }
+}
+
+#[test]
 fn add_files_to_existing_archives() {
     let tmp = tempdir().unwrap();
     let src = make_tree(tmp.path());

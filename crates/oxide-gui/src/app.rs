@@ -81,6 +81,7 @@ pub enum Action {
 
 pub struct OpenArchive {
     pub info: ArchiveInfo,
+    pub stats: ArchiveStats,
     pub tree: Tree,
     pub cwd: String,
     pub back: Vec<String>,
@@ -94,13 +95,28 @@ pub struct OpenArchive {
     pub scroll_to: Option<usize>,
 }
 
+/// Whole-archive totals are immutable while browsing; compute them once.
+pub struct ArchiveStats {
+    pub files: usize,
+    pub total_size: u64,
+    pub encrypted: bool,
+    pub compression_ratio: Option<f64>,
+}
+
 impl OpenArchive {
     fn new(info: ArchiveInfo) -> Self {
         let tree = Tree::build(&info.entries);
         // Skip a lone top-level folder, as most archives wrap their contents in one.
         let cwd = tree.single_root_dir().unwrap_or_default();
+        let stats = ArchiveStats {
+            files: info.file_count(),
+            total_size: info.total_size(),
+            encrypted: info.is_encrypted(),
+            compression_ratio: info.compression_ratio(),
+        };
         OpenArchive {
             info,
+            stats,
             tree,
             cwd,
             back: Vec::new(),

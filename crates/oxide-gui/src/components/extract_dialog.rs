@@ -15,6 +15,7 @@ pub struct ExtractDialog {
     pub folder_name: String,
     pub selection: Vec<String>,
     pub only_selected: bool,
+    pub strip_components: usize,
     pub overwrite: OverwritePolicy,
     pub password: String,
     pub encrypted: bool,
@@ -50,6 +51,7 @@ impl ExtractDialog {
             subfolder: true,
             folder_name: stem_without_archive_ext(info),
             only_selected: only_selected && !selection.is_empty(),
+            strip_components: 0,
             selection,
             overwrite: OverwritePolicy::Rename,
             password: password.map(|p| p.expose().to_owned()).unwrap_or_default(),
@@ -92,6 +94,13 @@ impl ExtractDialog {
                         ui.radio_value(&mut self.only_selected, true, format!("Selected ({})", self.selection.len()));
                     });
                 });
+                ui.end_row();
+
+                form_label(ui, "Remove leading folders");
+                ui.add(egui::DragValue::new(&mut self.strip_components).range(0..=usize::MAX).speed(0.1))
+                    .on_hover_text(
+                        "0 keeps the full path; 1 removes a top-level wrapper folder. Shorter paths are skipped.",
+                    );
                 ui.end_row();
 
                 form_label(ui, "If a file exists");
@@ -155,6 +164,7 @@ impl ExtractDialog {
             symlinks: if self.symlinks { SymlinkPolicy::Contained } else { SymlinkPolicy::Skip },
             limits: if self.protect { ExtractLimits::default() } else { ExtractLimits::unlimited() },
             selection: self.only_selected.then(|| self.selection.clone()),
+            strip_components: self.strip_components,
             password: (!self.password.is_empty()).then(|| self.password.clone().into()),
             ..ExtractOptions::default()
         }

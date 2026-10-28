@@ -37,7 +37,19 @@ pub struct Row {
 #[derive(Default)]
 pub struct Tree {
     children: HashMap<String, Vec<Row>>,
-    all: Vec<Row>,
+    all: Vec<SearchRow>,
+}
+
+struct SearchRow {
+    row: Row,
+    lowercase_path: String,
+}
+
+impl From<Row> for SearchRow {
+    fn from(row: Row) -> Self {
+        let lowercase_path = row.path.to_lowercase();
+        Self { row, lowercase_path }
+    }
 }
 
 fn kind_label(e: &Entry, name: &str) -> String {
@@ -106,7 +118,7 @@ impl Tree {
                         encrypted: e.encrypted,
                         link: e.link_target.clone(),
                     };
-                    all.push(row.clone());
+                    all.push(SearchRow::from(row.clone()));
                     children.entry(parent.clone()).or_default().push(row);
                 }
                 parent = full;
@@ -118,8 +130,7 @@ impl Tree {
                 row.modified = dir_times.get(&row.path).copied();
             }
         }
-        let mut dir_rows: Vec<Row> = children.values().flatten().filter(|r| r.is_dir).cloned().collect();
-        all.append(&mut dir_rows);
+        all.extend(children.values().flatten().filter(|r| r.is_dir).cloned().map(SearchRow::from));
         Tree { children, all }
     }
 
@@ -140,13 +151,14 @@ impl Tree {
         }
     }
 
-    /// Case-insensitive substring search over full paths.
+    /// Case-insensitive search over full paths; every whitespace-separated
+    /// term must match. Paths are folded once when the index is built.
     pub fn search(&self, query: &str) -> Vec<Row> {
-        let q = query.to_lowercase();
+        let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
         self.all
             .iter()
-            .filter(|r| r.path.to_lowercase().contains(&q))
-            .map(|r| Row { name: r.path.clone(), ..r.clone() })
+            .filter(|r| terms.iter().all(|term| r.lowercase_path.contains(term)))
+            .map(|r| Row { name: r.row.path.clone(), ..r.row.clone() })
             .collect()
     }
 }
@@ -171,35 +183,31 @@ pub fn sort_rows(rows: &mut [Row], key: SortKey, ascending: bool) {
 /// Case-insensitive comparison that orders embedded numbers numerically
 /// ("file2" before "file10").
 fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    let (mut a, mut b) = (a, b);
     loop {
-        match (a.peek().copied(), b.peek().copied()) {
+        match (a.chars().next(), b.chars().next()) {
             (None, None) => return Ordering::Equal,
             (None, _) => return Ordering::Less,
             (_, None) => return Ordering::Greater,
             (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
-                let take = |it: &mut std::iter::Peekable<std::str::Chars>| {
-                    let mut s = String::new();
-                    while let Some(c) = it.peek().filter(|c| c.is_ascii_digit()) {
-                        s.push(*c);
-                        it.next();
-                    }
-                    s
-                };
-                let (na, nb) = (take(&mut a), take(&mut b));
+                let a_len = a.bytes().take_while(u8::is_ascii_digit).count();
+                let b_len = b.bytes().take_while(u8::is_ascii_digit).count();
+                let (na, nb) = (&a[..a_len], &b[..b_len]);
                 let (ta, tb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
                 let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
                 if ord != Ordering::Equal {
                     return ord;
                 }
+                a = &a[a_len..];
+                b = &b[b_len..];
             }
             (Some(x), Some(y)) => {
                 let ord = x.to_lowercase().cmp(y.to_lowercase());
                 if ord != Ordering::Equal {
                     return ord;
                 }
-                a.next();
-                b.next();
+                a = &a[x.len_utf8()..];
+                b = &b[y.len_utf8()..];
             }
         }
     }
@@ -403,5 +411,30 @@ mod tests {
         let mut v = vec!["file10", "File2", "file1", "alpha"];
         v.sort_by(|a, b| natural_cmp(a, b));
         assert_eq!(v, ["alpha", "file1", "File2", "file10"]);
+    }
+
+    #[test]
+    fn search_matches_all_terms_across_unicode_paths() {
+        let tree = Tree::build(&[
+            entry("Docs/naïve/Report10.TXT", EntryKind::File, 10),
+            entry("Docs/other.txt", EntryKind::File, 5),
+            entry("Pictures/Report10.png", EntryKind::File, 1),
+        ]);
+        let found = tree.search("  REPORT10   NAÏVE txt ");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, "Docs/naïve/Report10.TXT");
+        assert_eq!(found[0].name, found[0].path);
+        assert!(tree.search("Docs png").is_empty());
+        assert_eq!(tree.search("docs NAÏVE").iter().filter(|r| r.is_dir).count(), 1);
+    }
+
+    #[test]
+    fn natural_sort_handles_large_numbers_and_unicode_without_integer_overflow() {
+        let mut names = ["é20", "É3", "é0002", "é1000000000000000000000000000000", "é999999999999999999999999999999"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(
+            names,
+            ["é0002", "É3", "é20", "é999999999999999999999999999999", "é1000000000000000000000000000000"]
+        );
     }
 }
